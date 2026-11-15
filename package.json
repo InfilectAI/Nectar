@@ -1,0 +1,46 @@
+{
+  "name": "@infilectai/nectar",
+  "version": "0.1.0",
+  "description": "Nectar — macOS meeting notepad, speaker-attributed transcription, temporal memory, and local MCP server powered by Aira, Cortex, and Synapse.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist-electron/main.js",
+  "bin": {
+    "nectar-mcp": "./bin/nectar-mcp.js"
+  },
+  "scripts": {
+    "dev:vite": "vite --port 5179",
+    "build:vite": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json && cp electron/preload.cjs dist-electron/preload.cjs",
+    "build": "npm run build:vite && npm run build:electron",
+    "start": "npm run build && electron ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/InfilectAI/Nectar.git"
+  },
+  "homepage": "https://github.com/InfilectAI/Nectar#readme",
+  "bugs": {
+    "url": "https://github.com/InfilectAI/Nectar/issues"
+  },
+  "dependencies": {
+    "@infilectai/aira": "^0.2.0",
+    "@infilectai/cortex": "^0.1.0",
+    "@infilectai/synapse": "^0.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^35.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}
