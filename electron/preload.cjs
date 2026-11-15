@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('nectar', {
   detectProcedures: () => ipcRenderer.invoke('nectar:detectProcedures'),
   setSkillStatus: (skillId, status) =>
     ipcRenderer.invoke('nectar:setSkillStatus', skillId, status),
+  installMcp: (target) => ipcRenderer.invoke('nectar:installMcp', target),
 
   // Subscriptions
   onEvent: (callback) => {

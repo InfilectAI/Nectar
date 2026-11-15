@@ -1,12 +1,14 @@
+import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, shell } from 'electron'
 
-import { Aira, type EyesSession, type MeetingTarget, type MeetingWatcher } from '@infilectai/aira'
+import { Aira, type EyesSession, type MeetingTarget, type MeetingWatcher, type STTProviderInput } from '@infilectai/aira'
 import { Cortex, type CortexServer } from '@infilectai/cortex'
 import { SourceEvent, SourceType, Synapse } from '@infilectai/synapse'
 
-import { distillMeeting } from './distiller.js'
+import { distillMeeting, resolveAiEndpoints } from './distiller.js'
 import { MCP_TOOLS, McpHttpServer } from './mcp-server.js'
 import { NectarStore, getNectarDataDir, type MeetingRecord, type NectarSettings } from './store.js'
 
@@ -20,6 +22,8 @@ let aira: Aira | null = null
 let cortexServer: CortexServer | null = null
 let cortexUrl: string | null = null
 let cortexStatus: 'running' | 'starting' | 'stopped' | 'cloud' = 'stopped'
+let cortexPrimitives: Record<string, string> = {}
+let healthPollTimer: NodeJS.Timeout | null = null
 let watcher: MeetingWatcher | null = null
 let detectedMeetings: MeetingTarget[] = []
 let activeCaptureSession: EyesSession | null = null
@@ -27,9 +31,36 @@ let activeCaptureMeetingId: string | null = null
 let mcpServer: McpHttpServer
 let simulationTimer: NodeJS.Timeout | null = null
 
+function cleanWhisperText(raw: string): string {
+  return raw
+    .replace(/<\|[^|]*\|>/g, ' ')
+    .replace(/\[(?:BLANK_AUDIO|SILENCE|MUSIC|NOISE|INAUDIBLE)\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function broadcast(type: string, data: unknown = {}): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('nectar:event', { type, ...(data as object) })
+  }
+}
+
+async function pollCortexHealth(port: number): Promise<void> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`)
+    if (!res.ok) return
+    const data = (await res.json()) as {
+      status?: string
+      primitives?: Record<string, string>
+    }
+    const nextPrims = data.primitives ?? {}
+    if (JSON.stringify(nextPrims) !== JSON.stringify(cortexPrimitives)) {
+      cortexPrimitives = nextPrims
+      cortexStatus = 'running'
+      broadcast('primitives:changed', { cortexPrimitives, cortexStatus })
+    }
+  } catch {
+    // ignore transient poll error
   }
 }
 
@@ -62,20 +93,195 @@ function deterministicEmbed(text: string, dims: number = 64): number[] {
   return vec.map((v) => v / norm)
 }
 
+function resolveSttAndDiarize(settings: NectarSettings): {
+  stt: STTProviderInput
+  diarize?: { url: string; apiKey?: string }
+} {
+  if (settings.mode === 'local') {
+    const base = (
+      cortexUrl ?? `http://127.0.0.1:${settings.localPort}`
+    ).replace(/\/+$/, '')
+    return {
+      stt: {
+        url: `${base}/v1/audio/transcriptions`,
+        model: settings.sttModel || 'whisper-large-v3',
+      },
+      diarize: {
+        url: `${base}/v1/audio/diarize`,
+      },
+    }
+  }
+
+  const provider = settings.cloudSttProvider || 'deepgram'
+  const apiKey = settings.cloudSttApiKey || settings.cloudAiApiKey
+
+  if (provider === 'deepgram') {
+    const model = settings.cloudSttModel || 'nova-3'
+    return {
+      // Deepgram bundles transcription + speaker diarization in one call (`diarize=true`)
+      stt: async (wav: Buffer) => {
+        const res = await fetch(
+          `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&smart_format=true&diarize=true`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Token ${apiKey}`,
+              'Content-Type': 'audio/wav',
+            },
+            body: new Uint8Array(wav),
+          },
+        )
+        if (!res.ok) {
+          throw new Error(`Deepgram STT failed (${res.status}): ${await res.text()}`)
+        }
+        const data = (await res.json()) as {
+          results?: {
+            channels?: Array<{
+              alternatives?: Array<{
+                transcript?: string
+                words?: Array<{
+                  word: string
+                  start: number
+                  end: number
+                  speaker?: number
+                }>
+              }>
+            }>
+          }
+        }
+        const alt = data.results?.channels?.[0]?.alternatives?.[0]
+        const text = alt?.transcript ?? ''
+        return { text }
+      },
+    }
+  }
+
+  if (provider === 'assemblyai') {
+    return {
+      // AssemblyAI bundles transcription + speaker_labels in its API
+      stt: async (wav: Buffer) => {
+        const upRes = await fetch('https://api.assemblyai.com/v2/upload', {
+          method: 'POST',
+          headers: {
+            Authorization: apiKey,
+            'Content-Type': 'application/octet-stream',
+          },
+          body: new Uint8Array(wav),
+        })
+        if (!upRes.ok) throw new Error(`AssemblyAI upload failed (${upRes.status})`)
+        const { upload_url } = (await upRes.json()) as { upload_url: string }
+        const trRes = await fetch('https://api.assemblyai.com/v2/transcript', {
+          method: 'POST',
+          headers: {
+            Authorization: apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            audio_url: upload_url,
+            speaker_labels: true,
+          }),
+        })
+        if (!trRes.ok) throw new Error(`AssemblyAI transcript failed (${trRes.status})`)
+        const { id } = (await trRes.json()) as { id: string }
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, 800))
+          const poll = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, {
+            headers: { Authorization: apiKey },
+          })
+          const statusObj = (await poll.json()) as {
+            status: string
+            text?: string
+          }
+          if (statusObj.status === 'completed') {
+            return { text: statusObj.text ?? '' }
+          }
+          if (statusObj.status === 'error') {
+            throw new Error('AssemblyAI transcription error')
+          }
+        }
+        return { text: '' }
+      },
+    }
+  }
+
+  if (provider === 'openai') {
+    return {
+      stt: {
+        url: 'https://api.openai.com/v1/audio/transcriptions',
+        model: settings.cloudSttModel || 'gpt-4o-transcribe',
+        apiKey,
+      },
+    }
+  }
+
+  if (provider === 'gemini') {
+    const model = settings.cloudSttModel || 'gemini-2.5-flash'
+    return {
+      stt: async (wav: Buffer) => {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    { text: 'Transcribe this audio verbatim. Return only the spoken words.' },
+                    {
+                      inline_data: {
+                        mime_type: 'audio/wav',
+                        data: wav.toString('base64'),
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
+          },
+        )
+        if (!res.ok) throw new Error(`Gemini STT failed (${res.status})`)
+        const body = (await res.json()) as {
+          candidates?: Array<{
+            content?: { parts?: Array<{ text?: string }> }
+          }>
+        }
+        const text = body.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
+        return { text }
+      },
+    }
+  }
+
+  return {
+    stt: {
+      url: settings.sttUrl || 'https://api.openai.com/v1/audio/transcriptions',
+      model: settings.sttModel || 'whisper-1',
+      apiKey: settings.sttApiKey || apiKey || undefined,
+    },
+    diarize: settings.diarizeUrl
+      ? {
+          url: settings.diarizeUrl,
+          apiKey: settings.diarizeApiKey || undefined,
+        }
+      : undefined,
+  }
+}
+
 async function initSynapse(settings: NectarSettings): Promise<void> {
   if (synapse) {
     await synapse.close().catch(() => {})
   }
   const synapseDbPath = path.join(getNectarDataDir(), 'synapse.db')
+  const ai = resolveAiEndpoints(settings, cortexUrl)
 
   synapse = await Synapse.open(synapseDbPath, {
     defaultGroupId: settings.groupId,
-    chatBaseUrl: settings.llmBaseUrl,
-    chatModel: settings.llmModel,
-    chatApiKey: settings.llmApiKey,
-    embeddingBaseUrl: settings.embeddingBaseUrl,
-    embeddingModel: settings.embeddingModel,
-    embeddingApiKey: settings.embeddingApiKey,
+    chatBaseUrl: ai.baseUrl,
+    chatModel: ai.llmModel,
+    chatApiKey: ai.apiKey,
+    embeddingBaseUrl: ai.baseUrl,
+    embeddingModel: ai.embeddingModel,
+    embeddingApiKey: ai.apiKey,
     embeddingDimensions: 64,
     memoryHitThreshold: 0.15,
     inferenceMode: 'fake',
@@ -145,20 +351,14 @@ async function initComputeAndPerception(settings: NectarSettings): Promise<void>
 
   // Initialize Aira for meeting detection & audio capture
   if (!aira) {
+    const resolved = resolveSttAndDiarize(settings)
     aira = await Aira.create({
-      stt: {
-        url: settings.sttUrl,
-        model: settings.sttModel || undefined,
-        apiKey: settings.sttApiKey || undefined,
-      },
-      diarize: {
-        url: settings.diarizeUrl,
-        apiKey: settings.diarizeApiKey || undefined,
-      },
+      stt: resolved.stt,
+      diarize: resolved.diarize,
     })
 
     watcher = aira.eyes.watchMeetings()
-    watcher.on('Detected', (meetings: MeetingTarget[]) => {
+    watcher.on('meetings', (meetings: MeetingTarget[]) => {
       detectedMeetings = meetings
       broadcast('meetings:detected', { detectedMeetings })
     })
@@ -278,6 +478,63 @@ async function seedInitialWorkspaceIfEmpty(): Promise<void> {
   await synapse.consolidate(groupId)
 }
 
+function getMcpInstalledState(): Record<
+  'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode',
+  boolean
+> {
+  const home = os.homedir()
+  const hasJsonMcp = (filePath: string, key = 'mcpServers'): boolean => {
+    try {
+      if (!fs.existsSync(filePath)) return false
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<
+        string,
+        unknown
+      >
+      const servers = parsed[key] as Record<string, unknown> | undefined
+      return Boolean(servers && typeof servers === 'object' && 'nectar' in servers)
+    } catch {
+      return false
+    }
+  }
+
+  const claudeCodePath = path.join(home, '.claude.json')
+  const claudeDesktopPath = path.join(
+    home,
+    'Library',
+    'Application Support',
+    'Claude',
+    'claude_desktop_config.json',
+  )
+  const cursorPath = path.join(home, '.cursor', 'mcp.json')
+  const copilotPath = path.join(home, '.copilot', 'mcp-config.json')
+  const vscodePath = path.join(
+    home,
+    'Library',
+    'Application Support',
+    'Code',
+    'User',
+    'mcp.json',
+  )
+  const codexPath = path.join(home, '.codex', 'config.toml')
+
+  let codexInstalled = false
+  try {
+    if (fs.existsSync(codexPath)) {
+      codexInstalled = fs.readFileSync(codexPath, 'utf8').includes('[mcp_servers.nectar]')
+    }
+  } catch {
+    codexInstalled = false
+  }
+
+  return {
+    claude: hasJsonMcp(claudeCodePath) || hasJsonMcp(claudeDesktopPath),
+    codex: codexInstalled,
+    cursor: hasJsonMcp(cursorPath),
+    copilot: hasJsonMcp(copilotPath),
+    vscode: hasJsonMcp(vscodePath, 'servers') || hasJsonMcp(vscodePath, 'mcpServers'),
+  }
+}
+
 async function getFullAppState() {
   const settings = store.getSettings()
   const meetings = store.listMeetings()
@@ -296,6 +553,7 @@ async function getFullAppState() {
     settings,
     cortexStatus,
     cortexUrl,
+    cortexPrimitives,
     detectedMeetings,
     activeCaptureMeetingId,
     permissions,
@@ -313,6 +571,7 @@ async function getFullAppState() {
       tools: MCP_TOOLS,
       requestsHandled: mcpServer.requestsHandled,
       stdioScriptPath: path.resolve(__dirname, '..', 'bin', 'nectar-mcp.js'),
+      installed: getMcpInstalledState(),
     },
   }
 }
@@ -333,7 +592,16 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('nectar:checkPermissions', async (_e, prompt: boolean) => {
     if (!aira) return {}
-    return aira.checkPermissions(Boolean(prompt))
+    const perms = await aira.checkPermissions(Boolean(prompt))
+    if (prompt && perms.accessibility !== 'granted') {
+      shell
+        .openExternal(
+          'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+        )
+        .catch(() => {})
+    }
+    broadcast('permissions:changed', { permissions: perms })
+    return perms
   })
 
   ipcMain.handle(
@@ -412,6 +680,9 @@ function registerIpcHandlers(): void {
     'nectar:startCapture',
     async (_e, target?: MeetingTarget, existingMeetingId?: string) => {
       if (!aira) throw new Error('Aira SDK not initialized')
+      const perms = await aira.checkPermissions(true).catch(() => ({}))
+      broadcast('permissions:changed', { permissions: perms })
+
       if (activeCaptureSession) {
         await activeCaptureSession.close().catch(() => {})
         activeCaptureSession = null
@@ -437,29 +708,24 @@ function registerIpcHandlers(): void {
 
       activeCaptureMeetingId = meeting.id
       const settings = store.getSettings()
+      const resolved = resolveSttAndDiarize(settings)
 
       const session = aira.startMeeting(resolvedTarget, {
-        stt: {
-          url: settings.sttUrl,
-          model: settings.sttModel || undefined,
-          apiKey: settings.sttApiKey || undefined,
-        },
-        diarize: {
-          url: settings.diarizeUrl,
-          apiKey: settings.diarizeApiKey || undefined,
-        },
+        stt: resolved.stt,
+        diarize: resolved.diarize,
       })
       activeCaptureSession = session
 
       ;(async () => {
         for await (const ev of session.events) {
           if (ev.type === 'transcript') {
-            if (!ev.partial && ev.text.trim()) {
+            const cleanedText = cleanWhisperText(ev.text)
+            if (!ev.partial && cleanedText) {
               const turn = store.addTranscriptTurn({
                 meetingId: meeting.id,
-                speaker: ev.name || 'Speaker',
+                speaker: ev.name || 'You',
                 participantId: ev.participantId ?? null,
-                text: ev.text.trim(),
+                text: cleanedText,
                 t0: ev.t0,
                 t1: ev.t1,
               })
@@ -481,11 +747,11 @@ function registerIpcHandlers(): void {
                 turn,
                 meeting: store.getMeeting(meeting.id),
               })
-            } else if (ev.partial) {
+            } else if (ev.partial && cleanedText) {
               broadcast('meeting:partial', {
                 meetingId: meeting.id,
-                speaker: ev.name,
-                text: ev.text,
+                speaker: ev.name || 'You',
+                text: cleanedText,
                 t0: ev.t0,
               })
             }
@@ -662,6 +928,115 @@ function registerIpcHandlers(): void {
       return { ok: true }
     },
   )
+
+  ipcMain.handle(
+    'nectar:installMcp',
+    async (
+      _e,
+      target: 'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode',
+    ) => {
+      const home = os.homedir()
+      const stdioScriptPath = path.resolve(__dirname, '..', 'bin', 'nectar-mcp.js')
+
+      const mergeJsonMcp = (
+        filePath: string,
+        entry: Record<string, unknown>,
+        rootKey = 'mcpServers',
+      ) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true })
+        let current: Record<string, unknown> = {}
+        if (fs.existsSync(filePath)) {
+          try {
+            current = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<
+              string,
+              unknown
+            >
+          } catch {
+            current = {}
+          }
+        }
+        const servers =
+          current[rootKey] && typeof current[rootKey] === 'object'
+            ? (current[rootKey] as Record<string, unknown>)
+            : {}
+        servers.nectar = entry
+        current[rootKey] = servers
+        fs.writeFileSync(filePath, JSON.stringify(current, null, 2) + '\n', 'utf8')
+      }
+
+      let targetPath = ''
+      if (target === 'claude') {
+        const claudeCodePath = path.join(home, '.claude.json')
+        const claudeDesktopPath = path.join(
+          home,
+          'Library',
+          'Application Support',
+          'Claude',
+          'claude_desktop_config.json',
+        )
+        const entry = { command: 'node', args: [stdioScriptPath] }
+        mergeJsonMcp(claudeCodePath, entry)
+        mergeJsonMcp(claudeDesktopPath, entry)
+        targetPath = claudeCodePath
+      } else if (target === 'cursor') {
+        const cursorPath = path.join(home, '.cursor', 'mcp.json')
+        mergeJsonMcp(cursorPath, { command: 'node', args: [stdioScriptPath] })
+        targetPath = cursorPath
+      } else if (target === 'copilot') {
+        const copilotPath = path.join(home, '.copilot', 'mcp-config.json')
+        mergeJsonMcp(copilotPath, {
+          type: 'local',
+          command: 'node',
+          args: [stdioScriptPath],
+          tools: ['*'],
+        })
+        targetPath = copilotPath
+      } else if (target === 'vscode') {
+        const vscodePath = path.join(
+          home,
+          'Library',
+          'Application Support',
+          'Code',
+          'User',
+          'mcp.json',
+        )
+        mergeJsonMcp(
+          vscodePath,
+          { type: 'stdio', command: 'node', args: [stdioScriptPath] },
+          'servers',
+        )
+        targetPath = vscodePath
+      } else if (target === 'codex') {
+        const codexPath = path.join(home, '.codex', 'config.toml')
+        fs.mkdirSync(path.dirname(codexPath), { recursive: true })
+        let toml = fs.existsSync(codexPath)
+          ? fs.readFileSync(codexPath, 'utf8')
+          : ''
+        const block = `\n[mcp_servers.nectar]\ncommand = "node"\nargs = [${JSON.stringify(stdioScriptPath)}]\n`
+        if (toml.includes('[mcp_servers.nectar]')) {
+          toml = toml.replace(
+            /\[mcp_servers\.nectar\][\s\S]*?(?=\n\[|$)/,
+            block.trim(),
+          )
+        } else {
+          toml = toml.trimEnd() + '\n' + block
+        }
+        fs.writeFileSync(codexPath, toml, 'utf8')
+        targetPath = codexPath
+      } else {
+        throw new Error(`Unknown MCP install target: ${String(target)}`)
+      }
+
+      const nextState = await getFullAppState()
+      broadcast('state:refresh', nextState)
+      return {
+        ok: true,
+        target,
+        path: targetPath,
+        installed: nextState.mcp.installed,
+      }
+    },
+  )
 }
 
 async function createWindow(): Promise<void> {
@@ -689,12 +1064,39 @@ async function createWindow(): Promise<void> {
 
 app.whenReady().then(async () => {
   store = new NectarStore()
+  // Sanitize any existing transcript turns and meeting summaries that contained raw Whisper <|...|> tokens
+  const existingTurns = store.db
+    .prepare(
+      `SELECT id, text, speaker FROM transcript_turns WHERE text LIKE '%<|%' OR speaker = 'Speaker'`,
+    )
+    .all() as Array<{ id: string; text: string; speaker: string }>
+  for (const row of existingTurns) {
+    const cleaned = cleanWhisperText(row.text)
+    const speaker = row.speaker === 'Speaker' ? 'You' : row.speaker
+    store.db
+      .prepare(`UPDATE transcript_turns SET text = ?, speaker = ? WHERE id = ?`)
+      .run(cleaned, speaker, row.id)
+  }
+
+  for (const m of store.listMeetings()) {
+    if (m.distilledNotes.includes('<|') || m.participants.includes('Speaker')) {
+      const cleanedNotes = m.distilledNotes.replace(/<\|[^|]*\|>/g, '').replace(/Speaker/g, 'You')
+      const cleanedParticipants = m.participants.map((p) => (p === 'Speaker' ? 'You' : p))
+      store.updateMeeting(m.id, {
+        distilledNotes: cleanedNotes,
+        participants: Array.from(new Set(cleanedParticipants)),
+      })
+    }
+  }
+
   const settings = store.getSettings()
 
   mcpServer = new McpHttpServer(store, () => synapse)
   await mcpServer.start(settings.mcpPort)
 
   await initComputeAndPerception(settings)
+  await pollCortexHealth(settings.localPort)
+
   await seedInitialWorkspaceIfEmpty()
 
   registerIpcHandlers()
@@ -708,6 +1110,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', async () => {
+  if (healthPollTimer) clearInterval(healthPollTimer)
   if (simulationTimer) clearInterval(simulationTimer)
   if (activeCaptureSession) await activeCaptureSession.close().catch(() => {})
   if (watcher) watcher.close()
