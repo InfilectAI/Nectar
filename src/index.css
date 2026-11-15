@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Geist", system-ui, -apple-system, sans-serif;
+  --font-display: "Geist", system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-chassis: #F5F5F2;
+  --color-well: #FFFFFF;
+  --color-strip: #ECECE7;
+  --color-recessed: #FAF9F6;
+  --color-rail: #DCDCD5;
+  --color-rail-strong: #C5C5BD;
+  --color-ink: #111113;
+  --color-muted: #595963;
+  --color-dim: #868690;
+  --color-signal: #EA4C10;
+  --color-signal-bright: #FF5A1F;
+  --color-signal-tint: #FFF1EB;
+  --color-amber: #B86E00;
+  --color-amber-tint: #FDF5E6;
+}
+
+@layer base {
+  html {
+    font-family: "Geist", system-ui, -apple-system, sans-serif;
+    background-color: #f5f5f2;
+    color: #111113;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.drafting-grid {
+  background-color: #faf9f6;
+  background-image: radial-gradient(#d8d8d0 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+.app-drag {
+  -webkit-app-region: drag;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
