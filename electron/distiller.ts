@@ -29,18 +29,61 @@ return a JSON object with:
 5. "relationships": array of {"subjectKind": string, "subjectName": string, "predicate": "owns"|"assigned_to"|"decides"|"blocks"|"implements", "objectKind": string, "objectName": string}
 Output valid JSON only.`
 
+export function resolveAiEndpoints(
+  settings: NectarSettings,
+  localCortexUrl?: string | null,
+): {
+  baseUrl: string
+  llmModel: string
+  embeddingModel: string
+  apiKey: string
+} {
+  if (settings.mode === 'local') {
+    const base = `${(localCortexUrl ?? `http://127.0.0.1:${settings.localPort}`).replace(/\/+$/, '')}/v1`
+    return {
+      baseUrl: base,
+      llmModel: settings.llmModel || 'gemma-4-E2B-it',
+      embeddingModel: settings.embeddingModel || 'embeddinggemma-300M',
+      apiKey: '',
+    }
+  }
+
+  if (settings.cloudAiProvider === 'gemini') {
+    return {
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+      llmModel: settings.cloudLlmModel || 'gemini-2.5-flash',
+      embeddingModel: settings.cloudEmbeddingModel || 'text-embedding-004',
+      apiKey: settings.cloudAiApiKey,
+    }
+  }
+
+  if (settings.cloudAiProvider === 'custom') {
+    return {
+      baseUrl: (settings.llmBaseUrl || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+      llmModel: settings.llmModel || 'gpt-4o-mini',
+      embeddingModel: settings.embeddingModel || 'text-embedding-3-small',
+      apiKey: settings.llmApiKey || settings.cloudAiApiKey,
+    }
+  }
+
+  // Default: OpenAI
+  return {
+    baseUrl: 'https://api.openai.com/v1',
+    llmModel: settings.cloudLlmModel || 'gpt-4o-mini',
+    embeddingModel: settings.cloudEmbeddingModel || 'text-embedding-3-small',
+    apiKey: settings.cloudAiApiKey,
+  }
+}
+
 export async function distillMeeting(
   meeting: MeetingRecord,
   settings: NectarSettings,
   localCortexUrl?: string | null,
 ): Promise<DistillResult> {
-  const baseUrl =
-    settings.mode === 'local'
-      ? (settings.llmBaseUrl || `${(localCortexUrl ?? `http://127.0.0.1:${settings.localPort}`).replace(/\/+$/, '')}/v1`).replace(/\/+$/, '')
-      : settings.llmBaseUrl.replace(/\/+$/, '')
-
-  const model = settings.llmModel
-  const apiKey = settings.llmApiKey
+  const { baseUrl, llmModel: model, apiKey } = resolveAiEndpoints(
+    settings,
+    localCortexUrl,
+  )
 
   const transcriptText = meeting.turns
     .map((t) => `[${formatTimecode(t.t0)}] ${t.speaker}: ${t.text}`)

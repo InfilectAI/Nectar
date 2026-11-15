@@ -1,8 +1,20 @@
+export type CloudSttProvider = 'deepgram' | 'assemblyai' | 'openai' | 'gemini' | 'custom'
+export type CloudAiProvider = 'openai' | 'gemini' | 'custom'
+
 export interface NectarSettings {
   mode: 'local' | 'cloud'
   groupId: string
   localPort: number
   mcpPort: number
+
+  cloudSttProvider: CloudSttProvider
+  cloudSttModel: string
+  cloudSttApiKey: string
+
+  cloudAiProvider: CloudAiProvider
+  cloudLlmModel: string
+  cloudEmbeddingModel: string
+  cloudAiApiKey: string
 
   sttUrl: string
   sttModel: string
@@ -121,6 +133,7 @@ export interface AppState {
   settings: NectarSettings
   cortexStatus: 'running' | 'starting' | 'stopped' | 'cloud'
   cortexUrl: string | null
+  cortexPrimitives: Record<string, string>
   detectedMeetings: MeetingTarget[]
   activeCaptureMeetingId: string | null
   permissions: Record<string, string>
@@ -138,6 +151,7 @@ export interface AppState {
     tools: Array<{ name: string; description: string }>
     requestsHandled: number
     stdioScriptPath: string
+    installed: Record<'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode', boolean>
   }
 }
 
@@ -167,6 +181,14 @@ declare global {
         skillId: string,
         status: 'candidate' | 'approved' | 'rejected',
       ): Promise<{ ok: boolean }>
+      installMcp(
+        target: 'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode',
+      ): Promise<{
+        ok: boolean
+        target: string
+        path: string
+        installed: Record<'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode', boolean>
+      }>
       onEvent(callback: (payload: Record<string, unknown>) => void): () => void
     }
   }

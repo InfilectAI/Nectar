@@ -4,28 +4,38 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+export type CloudSttProvider = 'deepgram' | 'assemblyai' | 'openai' | 'gemini' | 'custom'
+export type CloudAiProvider = 'openai' | 'gemini' | 'custom'
+
 export interface NectarSettings {
   mode: 'local' | 'cloud'
   groupId: string
   localPort: number
   mcpPort: number
 
-  // 1. Speech-to-Text (STT)
+  // Cloud simplified presets
+  cloudSttProvider: CloudSttProvider
+  cloudSttModel: string
+  cloudSttApiKey: string
+
+  cloudAiProvider: CloudAiProvider
+  cloudLlmModel: string
+  cloudEmbeddingModel: string
+  cloudAiApiKey: string
+
+  // Custom / Low-level overrides (auto-populated from presets)
   sttUrl: string
   sttModel: string
   sttApiKey: string
 
-  // 2. Speaker Diarization
   diarizeUrl: string
   diarizeModel: string
   diarizeApiKey: string
 
-  // 3. LLM (Chat / Note Enhancement)
   llmBaseUrl: string
   llmModel: string
   llmApiKey: string
 
-  // 4. Embeddings (Memory Vector Index)
   embeddingBaseUrl: string
   embeddingModel: string
   embeddingDimensions: number
@@ -67,20 +77,29 @@ export interface MeetingRecord {
 }
 
 export const LOCAL_PRESET: Omit<NectarSettings, 'mode' | 'groupId' | 'localPort' | 'mcpPort'> = {
+  cloudSttProvider: 'deepgram',
+  cloudSttModel: '',
+  cloudSttApiKey: '',
+
+  cloudAiProvider: 'openai',
+  cloudLlmModel: '',
+  cloudEmbeddingModel: '',
+  cloudAiApiKey: '',
+
   sttUrl: 'http://127.0.0.1:8000/v1/audio/transcriptions',
-  sttModel: 'whisper-large-v3',
+  sttModel: '',
   sttApiKey: '',
 
   diarizeUrl: 'http://127.0.0.1:8000/v1/audio/diarize',
-  diarizeModel: 'pyannote-speakerkit',
+  diarizeModel: '',
   diarizeApiKey: '',
 
   llmBaseUrl: 'http://127.0.0.1:8000/v1',
-  llmModel: 'gemma-4-E2B-it',
+  llmModel: '',
   llmApiKey: '',
 
   embeddingBaseUrl: 'http://127.0.0.1:8000/v1',
-  embeddingModel: 'embeddinggemma-300M',
+  embeddingModel: '',
   embeddingDimensions: 768,
   embeddingApiKey: '',
 }
