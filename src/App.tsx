@@ -16,6 +16,10 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
+import {
+  AgentIcon,
+  type McpAgentId,
+} from './components/AgentIcons'
 import type {
   AppState,
   MeetingRecord,
@@ -62,6 +66,11 @@ export default function App() {
   const [noteTab, setNoteTab] = useState<'notes' | 'summary'>('notes')
   const [showTranscript, setShowTranscript] = useState(true)
   const [showSettingsModal, setShowSettingsModal] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<'local' | 'cloud'>('local')
+  const [showCustomCloud, setShowCustomCloud] = useState(false)
+  const [showMcpModal, setShowMcpModal] = useState(false)
+  const [selectedMcpAgent, setSelectedMcpAgent] = useState<McpAgentId>('claude')
+  const [showManualMcp, setShowManualMcp] = useState(false)
   const [isDistilling, setIsDistilling] = useState(false)
   const [livePartial, setLivePartial] = useState<{ speaker: string; text: string } | null>(
     null,
@@ -89,6 +98,13 @@ export default function App() {
       } else if (ev.type === 'meetings:detected') {
         const detectedMeetings = ev.detectedMeetings as AppState['detectedMeetings']
         setState((prev) => (prev ? { ...prev, detectedMeetings } : prev))
+      } else if (ev.type === 'primitives:changed') {
+        const cortexPrimitives = ev.cortexPrimitives as Record<string, string>
+        const cortexStatus = (ev.cortexStatus as AppState['cortexStatus']) ?? 'running'
+        setState((prev) => (prev ? { ...prev, cortexPrimitives, cortexStatus } : prev))
+      } else if (ev.type === 'permissions:changed') {
+        const permissions = ev.permissions as Record<string, string>
+        setState((prev) => (prev ? { ...prev, permissions } : prev))
       } else if (ev.type === 'meeting:turn') {
         setLivePartial(null)
         const updatedMeeting = ev.meeting as MeetingRecord
@@ -246,8 +262,36 @@ export default function App() {
           </span>
         </div>
 
-        {/* Center Live Call Banner (Only shows when a call is detected or recording) */}
-        <div className="app-no-drag flex items-center">
+        {/* Center Live Call / Permission / Model Loading Banner */}
+        <div className="app-no-drag flex items-center gap-2">
+          {(state.permissions?.accessibility === 'denied' ||
+            state.permissions?.microphone === 'denied') && (
+            <div className="flex items-center gap-2 rounded-[4px] border border-amber bg-amber-tint px-2.5 py-0.5">
+              <span className="font-mono text-[10.5px] font-medium text-ink">
+                Permissions needed:{' '}
+                {state.permissions?.accessibility === 'denied' ? 'Accessibility ' : ''}
+                {state.permissions?.microphone === 'denied' ? 'Microphone' : ''}
+              </span>
+              <button
+                onClick={async () => {
+                  const perms = await window.nectar.checkPermissions(true)
+                  setState((prev) => (prev ? { ...prev, permissions: perms } : prev))
+                }}
+                className="rounded-[3px] bg-ink px-2 py-0.5 font-mono text-[10px] font-semibold text-well hover:bg-signal-bright"
+              >
+                Grant Access
+              </button>
+            </div>
+          )}
+
+          {(state.cortexPrimitives?.stt === 'loading' ||
+            state.cortexPrimitives?.diarize === 'loading') && (
+            <div className="flex items-center gap-2 rounded-[4px] border border-rail bg-well px-2.5 py-0.5 font-mono text-[10.5px] text-amber">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber animate-ping" />
+              <span>Loading speech models…</span>
+            </div>
+          )}
+
           {state.activeCaptureMeetingId ? (
             <div className="flex items-center gap-2.5 rounded-[4px] border border-signal bg-signal-tint px-3 py-1">
               <span className="h-2 w-2 rounded-full bg-signal-bright animate-pulse" />
@@ -278,40 +322,30 @@ export default function App() {
           ) : null}
         </div>
 
-        {/* Right Controls: Local/Cloud Toggle & Settings */}
-        <div className="app-no-drag flex items-center gap-2">
-          <div className="inline-flex rounded-[4px] border border-rail bg-well p-0.5 font-mono text-[10.5px]">
-            <button
-              onClick={() => handleToggleMode('local')}
-              className={`inline-flex items-center gap-1 rounded-[3px] px-2 py-0.5 transition-colors ${
-                state.settings.mode === 'local'
-                  ? 'bg-ink text-well font-semibold'
-                  : 'text-muted hover:text-ink'
-              }`}
-            >
-              <Cpu className="h-3 w-3" />
-              Local
-            </button>
-            <button
-              onClick={() => handleToggleMode('cloud')}
-              className={`inline-flex items-center gap-1 rounded-[3px] px-2 py-0.5 transition-colors ${
-                state.settings.mode === 'cloud'
-                  ? 'bg-signal text-white font-semibold'
-                  : 'text-muted hover:text-ink'
-              }`}
-            >
-              <Cloud className="h-3 w-3" />
-              Cloud
-            </button>
-          </div>
+        {/* Right Controls: MCP Button + Settings Button */}
+        <div className="app-no-drag flex items-center gap-1.5">
+          <button
+            onClick={() => setShowMcpModal(true)}
+            title="Connect MCP to Claude, Codex, Copilot, or Custom"
+            className="inline-flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-2.5 py-1 font-mono text-[10.5px] text-ink hover:border-ink/40"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
+            <span>MCP</span>
+          </button>
 
           <button
-            onClick={() => setShowSettingsModal(true)}
-            title="Settings & MCP"
-            className="inline-flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-2.5 py-1 font-mono text-[10.5px] text-muted hover:border-ink/40 hover:text-ink"
+            onClick={() => {
+              setSettingsTab(state.settings.mode === 'cloud' ? 'cloud' : 'local')
+              setShowSettingsModal(true)
+            }}
+            title="Settings"
+            className="inline-flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-2.5 py-1 font-mono text-[10.5px] text-ink hover:border-ink/40"
           >
-            <SettingsIcon className="h-3.5 w-3.5" />
+            <SettingsIcon className="h-3.5 w-3.5 text-muted" />
             <span>Settings</span>
+            <span className="rounded-[2px] bg-strip px-1.5 py-0.2 text-[9.5px] uppercase text-muted">
+              {state.settings.mode}
+            </span>
           </button>
         </div>
       </header>
@@ -638,8 +672,20 @@ export default function App() {
                     )}
 
                     {selectedMeeting.turns.length === 0 && !livePartial && (
-                      <div className="p-6 text-center text-[12.5px] text-muted">
-                        Transcript segments appear here during a meeting.
+                      <div className="p-6 text-center text-[12.5px] text-muted space-y-2">
+                        {state.cortexPrimitives?.stt === 'loading' ||
+                        state.cortexPrimitives?.diarize === 'loading' ? (
+                          <div className="rounded-[4px] border border-amber bg-amber-tint p-3 font-mono text-[11px] text-ink">
+                            Loading local WhisperKit &amp; SpeakerKit models into Apple
+                            Neural Engine… (first run takes ~20s)
+                          </div>
+                        ) : isRecordingThisMeeting ? (
+                          <div className="font-mono text-[11.5px] text-signal">
+                            Listening for speech…
+                          </div>
+                        ) : (
+                          <div>Transcript segments appear here during a meeting.</div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -654,14 +700,43 @@ export default function App() {
         </main>
       </div>
 
-      {/* Settings & MCP Modal */}
+      {/* Settings Modal with Local / Cloud Tabs */}
       {showSettingsModal && settingsDraft && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 backdrop-blur-[1px] p-4">
-          <div className="w-full max-w-2xl rounded-[4px] border border-rail bg-well shadow-xl overflow-hidden">
-            <div className="flex items-center justify-between border-b border-rail bg-strip px-5 py-3">
-              <span className="font-mono text-[11.5px] font-semibold text-ink uppercase">
-                Model Endpoints &amp; MCP Server
-              </span>
+          <div className="w-full max-w-lg rounded-[4px] border border-rail bg-well shadow-xl overflow-hidden">
+            {/* Modal Header with Local / Cloud Tabs */}
+            <div className="flex items-center justify-between border-b border-rail bg-strip px-4 py-2.5">
+              <div className="inline-flex rounded-[4px] border border-rail bg-chassis p-0.5 font-mono text-[11px]">
+                <button
+                  onClick={() => {
+                    setSettingsTab('local')
+                    setSettingsDraft({ ...settingsDraft, mode: 'local' })
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-[3px] px-3 py-1 transition-colors ${
+                    settingsTab === 'local'
+                      ? 'bg-ink text-well font-semibold'
+                      : 'text-muted hover:text-ink'
+                  }`}
+                >
+                  <Cpu className="h-3 w-3" />
+                  Local
+                </button>
+                <button
+                  onClick={() => {
+                    setSettingsTab('cloud')
+                    setSettingsDraft({ ...settingsDraft, mode: 'cloud' })
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-[3px] px-3 py-1 transition-colors ${
+                    settingsTab === 'cloud'
+                      ? 'bg-signal text-white font-semibold'
+                      : 'text-muted hover:text-ink'
+                  }`}
+                >
+                  <Cloud className="h-3 w-3" />
+                  Cloud
+                </button>
+              </div>
+
               <button
                 onClick={() => setShowSettingsModal(false)}
                 className="text-muted hover:text-ink"
@@ -671,293 +746,788 @@ export default function App() {
             </div>
 
             <div className="p-5 space-y-4 max-h-[82vh] overflow-y-auto">
-              {/* 1. Speech-to-Text (STT) */}
-              <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
-                <div className="font-mono text-[11px] font-semibold text-ink uppercase">
-                  1 · Speech-to-Text (STT)
-                </div>
-                <div className="grid grid-cols-3 gap-2.5">
-                  <div className="col-span-2">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Endpoint URL
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.sttUrl}
-                      onChange={(e) =>
-                        setSettingsDraft({ ...settingsDraft, sttUrl: e.target.value })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Model
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.sttModel}
-                      onChange={(e) =>
-                        setSettingsDraft({ ...settingsDraft, sttModel: e.target.value })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      API Key (optional for local)
-                    </label>
-                    <input
-                      type="password"
-                      value={settingsDraft.sttApiKey}
-                      onChange={(e) =>
-                        setSettingsDraft({ ...settingsDraft, sttApiKey: e.target.value })
-                      }
-                      placeholder="sk-..."
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                </div>
-              </div>
+              {/* TAB 1: LOCAL ON-DEVICE */}
+              {settingsTab === 'local' && (
+                <div className="space-y-4">
+                  <div className="rounded-[4px] border border-rail bg-recessed p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-[11px] font-semibold text-ink uppercase">
+                        On-Device Runtime
+                      </span>
+                      <span className="rounded-[3px] bg-emerald-950 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+                        100% LOCAL
+                      </span>
+                    </div>
+                    <p className="text-[12.5px] text-muted leading-relaxed">
+                      Runs transcription, speaker diarization, note enhancement, and memory
+                      embeddings locally on your Mac.
+                    </p>
 
-              {/* 2. Speaker Diarization */}
-              <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
-                <div className="font-mono text-[11px] font-semibold text-ink uppercase">
-                  2 · Speaker Diarization
-                </div>
-                <div className="grid grid-cols-3 gap-2.5">
-                  <div className="col-span-2">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Endpoint URL
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.diarizeUrl}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          diarizeUrl: e.target.value,
-                        })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Model
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.diarizeModel}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          diarizeModel: e.target.value,
-                        })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      API Key (optional for local)
-                    </label>
-                    <input
-                      type="password"
-                      value={settingsDraft.diarizeApiKey}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          diarizeApiKey: e.target.value,
-                        })
-                      }
-                      placeholder="sk-..."
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                </div>
-              </div>
+                    <div className="grid grid-cols-4 gap-2 pt-1 font-mono text-[10.5px]">
+                      {(['stt', 'diarize', 'chat', 'embed'] as const).map((prim) => (
+                        <div
+                          key={prim}
+                          className="rounded-[3px] border border-rail bg-well p-2 text-center"
+                        >
+                          <div className="text-[9.5px] text-muted uppercase">{prim}</div>
+                          <div className="font-semibold text-ink mt-0.5">
+                            {state.cortexPrimitives?.[prim] ?? 'ready'}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
 
-              {/* 3. LLM (Note Enhancement & Memory) */}
-              <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
-                <div className="font-mono text-[11px] font-semibold text-ink uppercase">
-                  3 · LLM (Note Enhancement &amp; Memory)
-                </div>
-                <div className="grid grid-cols-3 gap-2.5">
-                  <div className="col-span-2">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Base URL (OpenAI-compatible)
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.llmBaseUrl}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          llmBaseUrl: e.target.value,
-                        })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
+                    <div className="pt-2">
+                      <label className="block font-mono text-[10.5px] text-muted mb-1">
+                        Local Server Port
+                      </label>
+                      <input
+                        type="number"
+                        value={settingsDraft.localPort}
+                        onChange={(e) =>
+                          setSettingsDraft({
+                            ...settingsDraft,
+                            localPort: Number(e.target.value),
+                          })
+                        }
+                        className="w-36 rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[12px]"
+                      />
+                    </div>
                   </div>
-                  <div>
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Model
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.llmModel}
-                      onChange={(e) =>
-                        setSettingsDraft({ ...settingsDraft, llmModel: e.target.value })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      API Key (optional for local)
-                    </label>
-                    <input
-                      type="password"
-                      value={settingsDraft.llmApiKey}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          llmApiKey: e.target.value,
-                        })
-                      }
-                      placeholder="sk-..."
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                </div>
-              </div>
 
-              {/* 4. Embedding (Memory Vector Index) */}
-              <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
-                <div className="font-mono text-[11px] font-semibold text-ink uppercase">
-                  4 · Embedding (Memory Index)
-                </div>
-                <div className="grid grid-cols-4 gap-2.5">
-                  <div className="col-span-2">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Base URL (OpenAI-compatible)
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.embeddingBaseUrl}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          embeddingBaseUrl: e.target.value,
-                        })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Model
-                    </label>
-                    <input
-                      type="text"
-                      value={settingsDraft.embeddingModel}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          embeddingModel: e.target.value,
-                        })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      Dims
-                    </label>
-                    <input
-                      type="number"
-                      value={settingsDraft.embeddingDimensions}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          embeddingDimensions: Number(e.target.value),
-                        })
-                      }
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </div>
-                  <div className="col-span-4">
-                    <label className="block font-mono text-[10px] text-muted mb-1">
-                      API Key (optional for local)
-                    </label>
-                    <input
-                      type="password"
-                      value={settingsDraft.embeddingApiKey}
-                      onChange={(e) =>
-                        setSettingsDraft({
-                          ...settingsDraft,
-                          embeddingApiKey: e.target.value,
-                        })
-                      }
-                      placeholder="sk-..."
-                      className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
+                  {/* macOS Permissions row */}
+                  <div className="flex items-center justify-between rounded-[4px] border border-rail bg-chassis px-3.5 py-2.5 font-mono text-[11px]">
+                    <div className="flex items-center gap-3">
+                      <span>
+                        Accessibility:{' '}
+                        <strong
+                          className={
+                            state.permissions?.accessibility === 'granted'
+                              ? 'text-emerald-700'
+                              : 'text-signal'
+                          }
+                        >
+                          {state.permissions?.accessibility ?? 'granted'}
+                        </strong>
+                      </span>
+                      <span>·</span>
+                      <span>
+                        Mic:{' '}
+                        <strong
+                          className={
+                            state.permissions?.microphone === 'granted'
+                              ? 'text-emerald-700'
+                              : 'text-signal'
+                          }
+                        >
+                          {state.permissions?.microphone ?? 'granted'}
+                        </strong>
+                      </span>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        const perms = await window.nectar.checkPermissions(true)
+                        setState((prev) => (prev ? { ...prev, permissions: perms } : prev))
+                      }}
+                      className="rounded-[3px] border border-rail bg-well px-2.5 py-1 text-[10.5px] font-semibold text-ink hover:border-ink/40"
+                    >
+                      Check Permissions
+                    </button>
                   </div>
                 </div>
-              </div>
+              )}
 
-              {/* Local MCP Server */}
-              <div className="pt-3 border-t border-rail space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="font-mono text-[11px] font-semibold text-muted uppercase">
-                    Local MCP Server ({state.mcp.url})
-                  </span>
-                  <button
-                    onClick={() => copyText('mcp', mcpClaudeConfig)}
-                    className="inline-flex items-center gap-1 font-mono text-[11px] text-ink hover:text-signal"
-                  >
-                    {copiedKey === 'mcp' ? (
-                      <>
-                        <Check className="h-3 w-3 text-signal" />
-                        <span className="text-signal">Copied</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="h-3 w-3" />
-                        <span>Copy Config</span>
-                      </>
+              {/* TAB 2: CLOUD PROVIDERS */}
+              {settingsTab === 'cloud' && (
+                <div className="space-y-3.5">
+                  {/* 1. Transcription & Diarization */}
+                  <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-[11px] font-semibold text-ink uppercase">
+                        Transcription &amp; Diarization
+                      </span>
+                      <span className="font-mono text-[10px] text-muted">
+                        Diarization included
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          Provider
+                        </label>
+                        <select
+                          value={settingsDraft.cloudSttProvider}
+                          onChange={(e) => {
+                            const p = e.target.value as NectarSettings['cloudSttProvider']
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudSttProvider: p,
+                            })
+                            if (p === 'custom') setShowCustomCloud(true)
+                          }}
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        >
+                          <option value="deepgram">Deepgram</option>
+                          <option value="assemblyai">AssemblyAI</option>
+                          <option value="openai">OpenAI</option>
+                          <option value="gemini">Google Gemini</option>
+                          <option value="custom">Custom API</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          Model Name (optional)
+                        </label>
+                        <input
+                          type="text"
+                          value={settingsDraft.cloudSttModel}
+                          onChange={(e) =>
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudSttModel: e.target.value,
+                            })
+                          }
+                          placeholder="e.g. nova-3, universal-2, whisper-1"
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        />
+                      </div>
+
+                      <div className="col-span-2">
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          API Key
+                        </label>
+                        <input
+                          type="password"
+                          value={settingsDraft.cloudSttApiKey}
+                          onChange={(e) =>
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudSttApiKey: e.target.value,
+                            })
+                          }
+                          placeholder="Enter provider API key…"
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 2. LLM & Embeddings */}
+                  <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
+                    <div className="font-mono text-[11px] font-semibold text-ink uppercase">
+                      LLM &amp; Embeddings
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2.5">
+                      <div>
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          Provider
+                        </label>
+                        <select
+                          value={settingsDraft.cloudAiProvider}
+                          onChange={(e) => {
+                            const p = e.target.value as NectarSettings['cloudAiProvider']
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudAiProvider: p,
+                            })
+                            if (p === 'custom') setShowCustomCloud(true)
+                          }}
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        >
+                          <option value="openai">OpenAI</option>
+                          <option value="gemini">Google Gemini</option>
+                          <option value="custom">Custom API</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          LLM Model
+                        </label>
+                        <input
+                          type="text"
+                          value={settingsDraft.cloudLlmModel}
+                          onChange={(e) =>
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudLlmModel: e.target.value,
+                            })
+                          }
+                          placeholder="Model ID…"
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          Embedding Model
+                        </label>
+                        <input
+                          type="text"
+                          value={settingsDraft.cloudEmbeddingModel}
+                          onChange={(e) =>
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudEmbeddingModel: e.target.value,
+                            })
+                          }
+                          placeholder="Model ID…"
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        />
+                      </div>
+
+                      <div className="col-span-3">
+                        <label className="block font-mono text-[10px] text-muted mb-1">
+                          API Key
+                        </label>
+                        <input
+                          type="password"
+                          value={settingsDraft.cloudAiApiKey}
+                          onChange={(e) =>
+                            setSettingsDraft({
+                              ...settingsDraft,
+                              cloudAiApiKey: e.target.value,
+                            })
+                          }
+                          placeholder="Enter provider API key…"
+                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Collapsible Custom Endpoints Per Model */}
+                  <div className="rounded-[4px] border border-rail bg-chassis">
+                    <button
+                      type="button"
+                      onClick={() => setShowCustomCloud(!showCustomCloud)}
+                      className="flex w-full items-center justify-between px-3.5 py-2 font-mono text-[10.5px] font-semibold text-muted hover:text-ink"
+                    >
+                      <span>Custom Endpoints (URL, Model &amp; Key per Primitive)</span>
+                      <span>{showCustomCloud ? '−' : '+'}</span>
+                    </button>
+
+                    {showCustomCloud && (
+                      <div className="border-t border-rail p-3.5 space-y-2.5 bg-recessed">
+                        <div className="grid grid-cols-3 gap-2">
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              STT URL
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.sttUrl}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  sttUrl: e.target.value,
+                                })
+                              }
+                              placeholder="https://.../v1/audio/transcriptions"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              STT Model
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.sttModel}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  sttModel: e.target.value,
+                                })
+                              }
+                              placeholder="Model name…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              STT Key
+                            </label>
+                            <input
+                              type="password"
+                              value={settingsDraft.sttApiKey}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  sttApiKey: e.target.value,
+                                })
+                              }
+                              placeholder="API Key…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              Diarize URL (optional)
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.diarizeUrl}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  diarizeUrl: e.target.value,
+                                })
+                              }
+                              placeholder="https://.../v1/audio/diarize"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              Diarize Model
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.diarizeModel}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  diarizeModel: e.target.value,
+                                })
+                              }
+                              placeholder="Model name…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              Diarize Key
+                            </label>
+                            <input
+                              type="password"
+                              value={settingsDraft.diarizeApiKey}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  diarizeApiKey: e.target.value,
+                                })
+                              }
+                              placeholder="API Key…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              LLM Base URL
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.llmBaseUrl}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  llmBaseUrl: e.target.value,
+                                })
+                              }
+                              placeholder="https://.../v1"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              LLM Model
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.llmModel}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  llmModel: e.target.value,
+                                })
+                              }
+                              placeholder="Model name…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              LLM Key
+                            </label>
+                            <input
+                              type="password"
+                              value={settingsDraft.llmApiKey}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  llmApiKey: e.target.value,
+                                })
+                              }
+                              placeholder="API Key…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              Embedding Base URL
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.embeddingBaseUrl}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  embeddingBaseUrl: e.target.value,
+                                })
+                              }
+                              placeholder="https://.../v1"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              Embedding Model
+                            </label>
+                            <input
+                              type="text"
+                              value={settingsDraft.embeddingModel}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  embeddingModel: e.target.value,
+                                })
+                              }
+                              placeholder="Model name…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                              Embedding Key
+                            </label>
+                            <input
+                              type="password"
+                              value={settingsDraft.embeddingApiKey}
+                              onChange={(e) =>
+                                setSettingsDraft({
+                                  ...settingsDraft,
+                                  embeddingApiKey: e.target.value,
+                                })
+                              }
+                              placeholder="API Key…"
+                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                            />
+                          </div>
+                        </div>
+                      </div>
                     )}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-2 border-t border-rail">
+                <span className="font-mono text-[10.5px] text-muted">
+                  Mode: <strong className="uppercase text-ink">{settingsDraft.mode}</strong>
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setShowSettingsModal(false)}
+                    className="rounded-[4px] border border-rail bg-well px-3.5 py-1.5 font-mono text-[11.5px] text-muted hover:text-ink"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={async () => {
+                      const next = await window.nectar.saveSettings(settingsDraft)
+                      setState(next)
+                      setShowSettingsModal(false)
+                    }}
+                    className="rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright"
+                  >
+                    Save
                   </button>
                 </div>
-                <p className="text-[12px] text-muted">
-                  Tools: <code className="font-mono text-ink">list_meetings</code>,{' '}
-                  <code className="font-mono text-ink">get_meeting</code>,{' '}
-                  <code className="font-mono text-ink">find_memory</code>
-                </p>
-                <pre className="rounded-[4px] border border-rail bg-chassis p-3 font-mono text-[11px] text-ink overflow-x-auto">
-                  {mcpClaudeConfig}
-                </pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Paper-Style "Connect your agent" MCP Modal */}
+      {showMcpModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 backdrop-blur-[1px] p-4">
+          <div className="w-full max-w-2xl rounded-[6px] border border-rail bg-well shadow-xl overflow-hidden flex flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-rail bg-strip px-5 py-3.5">
+              <span className="text-[15px] font-semibold tracking-[-0.015em] text-ink">
+                Connect your agent
+              </span>
+              <button
+                onClick={() => setShowMcpModal(false)}
+                className="text-muted hover:text-ink"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Two-Pane Body */}
+            <div className="flex min-h-[380px]">
+              {/* Left Agent Selector List with Brand Icons */}
+              <div className="w-48 shrink-0 border-r border-rail bg-chassis p-2.5 space-y-1">
+                {(
+                  [
+                    { id: 'claude', label: 'Claude' },
+                    { id: 'codex', label: 'Codex' },
+                    { id: 'cursor', label: 'Cursor' },
+                    { id: 'copilot', label: 'GitHub Copilot' },
+                    { id: 'vscode', label: 'VS Code' },
+                    { id: 'other', label: 'Other agents' },
+                  ] as const
+                ).map((agent) => {
+                  const active = selectedMcpAgent === agent.id
+                  const isConnected =
+                    agent.id !== 'other' && Boolean(state.mcp.installed?.[agent.id])
+                  return (
+                    <button
+                      key={agent.id}
+                      onClick={() => {
+                        setSelectedMcpAgent(agent.id)
+                        setShowManualMcp(agent.id === 'other')
+                      }}
+                      className={`flex w-full items-center justify-between rounded-[4px] px-2.5 py-2 text-left text-[12.5px] font-medium transition-colors ${
+                        active
+                          ? 'bg-well text-ink shadow-2xs border border-rail'
+                          : 'text-muted hover:bg-recessed hover:text-ink border border-transparent'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2.5">
+                        <AgentIcon agent={agent.id} className="h-4 w-4 shrink-0" />
+                        <span className="truncate">{agent.label}</span>
+                      </span>
+                      {isConnected && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-600 shrink-0" />
+                      )}
+                    </button>
+                  )
+                })}
               </div>
 
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  onClick={() => setShowSettingsModal(false)}
-                  className="rounded-[4px] border border-rail bg-well px-3.5 py-1.5 font-mono text-[11.5px] text-muted hover:text-ink"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={async () => {
-                    const next = await window.nectar.saveSettings(settingsDraft)
-                    setState(next)
-                    setShowSettingsModal(false)
-                  }}
-                  className="rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright"
-                >
-                  Save
-                </button>
+              {/* Right Steps Pane */}
+              <div className="flex-1 p-6 space-y-5 overflow-y-auto bg-well">
+                {(() => {
+                  const agentLabels: Record<McpAgentId, string> = {
+                    claude: 'Claude',
+                    codex: 'Codex',
+                    cursor: 'Cursor',
+                    copilot: 'GitHub Copilot',
+                    vscode: 'VS Code',
+                    other: 'your agent',
+                  }
+                  const label = agentLabels[selectedMcpAgent]
+                  const isInstalled =
+                    selectedMcpAgent !== 'other' &&
+                    Boolean(state.mcp.installed?.[selectedMcpAgent])
+
+                  return (
+                    <>
+                      {/* Step 1: Nectar Desktop Running */}
+                      <div className="flex items-center gap-3">
+                        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-signal text-white">
+                          <Check className="h-3 w-3 stroke-[2.5]" />
+                        </span>
+                        <span className="text-[13.5px] font-medium text-ink">
+                          Nectar MCP server active ({state.mcp.url})
+                        </span>
+                      </div>
+
+                      {/* Step 2: Connect to Agent */}
+                      <div className="space-y-2.5">
+                        <div className="flex items-center gap-3">
+                          {isInstalled ? (
+                            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-signal text-white">
+                              <Check className="h-3 w-3 stroke-[2.5]" />
+                            </span>
+                          ) : (
+                            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-strip font-mono text-[11px] font-semibold text-ink">
+                              2
+                            </span>
+                          )}
+                          <span className="text-[13.5px] font-medium text-ink">
+                            Connect to {label}
+                          </span>
+                        </div>
+
+                        <div className="pl-8 space-y-2">
+                          {selectedMcpAgent !== 'other' && (
+                            <div className="flex items-center justify-between rounded-[4px] border border-rail bg-recessed px-3.5 py-2.5">
+                              <span className="text-[12.5px] text-muted">
+                                Add Nectar to {label} as an MCP server
+                              </span>
+                              <button
+                                onClick={async () => {
+                                  const res = await window.nectar.installMcp(
+                                    selectedMcpAgent,
+                                  )
+                                  setState((prev) =>
+                                    prev
+                                      ? {
+                                          ...prev,
+                                          mcp: {
+                                            ...prev.mcp,
+                                            installed: res.installed,
+                                          },
+                                        }
+                                      : prev,
+                                  )
+                                }}
+                                className={`inline-flex items-center gap-2 rounded-[4px] border px-3 py-1.5 font-mono text-[11.5px] font-semibold transition-colors ${
+                                  isInstalled
+                                    ? 'border-emerald-700/40 bg-emerald-950/10 text-emerald-800'
+                                    : 'border-rail bg-well text-ink hover:border-ink'
+                                }`}
+                              >
+                                <AgentIcon
+                                  agent={selectedMcpAgent}
+                                  className="h-3.5 w-3.5"
+                                />
+                                <span>
+                                  {isInstalled
+                                    ? `Connected to ${label}`
+                                    : `Add to ${label}`}
+                                </span>
+                              </button>
+                            </div>
+                          )}
+
+                          {/* Manual Install Accordion */}
+                          <div className="rounded-[4px] border border-rail bg-recessed">
+                            <button
+                              type="button"
+                              onClick={() => setShowManualMcp(!showManualMcp)}
+                              className="flex w-full items-center justify-between px-3.5 py-2.5 text-[12.5px] text-muted hover:text-ink"
+                            >
+                              <span>Or, install manually</span>
+                              <span className="font-mono text-sm">
+                                {showManualMcp ? '−' : '+'}
+                              </span>
+                            </button>
+
+                            {showManualMcp && (
+                              <div className="border-t border-rail p-3.5 space-y-2.5 bg-chassis">
+                                <div className="flex items-center justify-between font-mono text-[10.5px]">
+                                  <span className="text-muted">
+                                    HTTP MCP Endpoint:
+                                  </span>
+                                  <button
+                                    onClick={() =>
+                                      copyText('mcp-url', state.mcp.url)
+                                    }
+                                    className="inline-flex items-center gap-1 text-ink hover:text-signal"
+                                  >
+                                    {copiedKey === 'mcp-url' ? (
+                                      <>
+                                        <Check className="h-3 w-3 text-signal" />
+                                        <span className="text-signal">Copied</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="h-3 w-3" />
+                                        <span>Copy URL</span>
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                                <div className="rounded-[3px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11px] text-ink">
+                                  {state.mcp.url}
+                                </div>
+
+                                <div className="flex items-center justify-between font-mono text-[10.5px] pt-1">
+                                  <span className="text-muted">
+                                    Stdio configuration (mcp.json):
+                                  </span>
+                                  <button
+                                    onClick={() => copyText('mcp', mcpClaudeConfig)}
+                                    className="inline-flex items-center gap-1 text-ink hover:text-signal"
+                                  >
+                                    {copiedKey === 'mcp' ? (
+                                      <>
+                                        <Check className="h-3 w-3 text-signal" />
+                                        <span className="text-signal">Copied</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="h-3 w-3" />
+                                        <span>Copy JSON</span>
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                                <pre className="rounded-[3px] border border-rail bg-well p-2.5 font-mono text-[10.5px] text-ink overflow-x-auto">
+                                  {mcpClaudeConfig}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Step 3: Run Your First Prompt */}
+                      <div className="space-y-2.5">
+                        <div className="flex items-center gap-3">
+                          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-strip font-mono text-[11px] font-semibold text-ink">
+                            3
+                          </span>
+                          <span className="text-[13.5px] font-medium text-ink">
+                            Run your first prompt
+                          </span>
+                        </div>
+
+                        <div className="pl-8 space-y-2">
+                          <p className="text-[12px] text-muted">
+                            Run one of these example prompts in {label} to test the
+                            connection:
+                          </p>
+                          <div className="space-y-1.5">
+                            {[
+                              'List my recent meetings in Nectar and summarize the latest one',
+                              'Find in Nectar memory: Who owns checkout-service right now?',
+                              'What action items were assigned in the Q4 On-Call meeting?',
+                            ].map((prompt, idx) => (
+                              <button
+                                key={idx}
+                                onClick={() => copyText(`prompt-${idx}`, prompt)}
+                                className="flex items-center gap-2 rounded-full border border-rail bg-recessed px-3 py-1.5 text-left text-[12px] text-ink hover:border-ink/40 transition-colors"
+                              >
+                                {copiedKey === `prompt-${idx}` ? (
+                                  <Check className="h-3.5 w-3.5 text-signal shrink-0" />
+                                ) : (
+                                  <Copy className="h-3.5 w-3.5 text-muted shrink-0" />
+                                )}
+                                <span className="truncate">{prompt}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  )
+                })()}
               </div>
+            </div>
+
+            {/* Footer */}
+            <div className="flex items-center justify-between border-t border-rail bg-strip px-5 py-3">
+              <span className="font-mono text-[11px] text-muted">
+                Tools: list_meetings · get_meeting · find_memory
+              </span>
+              <button
+                onClick={() => setShowMcpModal(false)}
+                className="rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright"
+              >
+                Done
+              </button>
             </div>
           </div>
         </div>
