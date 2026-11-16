@@ -14,8 +14,13 @@ contextBridge.exposeInMainWorld('nectar', {
   // Live Capture & Simulation
   startCapture: (target, meetingId) =>
     ipcRenderer.invoke('nectar:startCapture', target, meetingId),
+  pauseCapture: () => ipcRenderer.invoke('nectar:pauseCapture'),
+  resumeCapture: () => ipcRenderer.invoke('nectar:resumeCapture'),
   stopCapture: () => ipcRenderer.invoke('nectar:stopCapture'),
   simulateLiveMeeting: () => ipcRenderer.invoke('nectar:simulateLiveMeeting'),
+  focusMainWindow: () => ipcRenderer.invoke('nectar:focusMainWindow'),
+  startPillDrag: () => ipcRenderer.send('nectar:startPillDrag'),
+  dragPill: () => ipcRenderer.send('nectar:dragPill'),
 
   // Synapse Memory & Knowledge Graph
   recall: (query) => ipcRenderer.invoke('nectar:recall', query),

@@ -2,7 +2,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, screen, shell } from 'electron'
 
 import { Aira, type EyesSession, type MeetingTarget, type MeetingWatcher, type STTProviderInput } from '@infilectai/aira'
 import { Cortex, type CortexServer } from '@infilectai/cortex'
@@ -16,6 +16,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 let mainWindow: BrowserWindow | null = null
+let pillWindow: BrowserWindow | null = null
 let store: NectarStore
 let synapse: Synapse
 let aira: Aira | null = null
@@ -28,6 +29,8 @@ let watcher: MeetingWatcher | null = null
 let detectedMeetings: MeetingTarget[] = []
 let activeCaptureSession: EyesSession | null = null
 let activeCaptureMeetingId: string | null = null
+let capturePaused = false
+let pillDragOffset: { x: number; y: number } | null = null
 let mcpServer: McpHttpServer
 let simulationTimer: NodeJS.Timeout | null = null
 
@@ -40,8 +43,12 @@ function cleanWhisperText(raw: string): string {
 }
 
 function broadcast(type: string, data: unknown = {}): void {
+  const payload = { type, ...(data as object) }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('nectar:event', { type, ...(data as object) })
+    mainWindow.webContents.send('nectar:event', payload)
+  }
+  if (pillWindow && !pillWindow.isDestroyed()) {
+    pillWindow.webContents.send('nectar:event', payload)
   }
 }
 
@@ -556,6 +563,7 @@ async function getFullAppState() {
     cortexPrimitives,
     detectedMeetings,
     activeCaptureMeetingId,
+    capturePaused,
     permissions,
     meetings,
     graph: {
@@ -707,6 +715,7 @@ function registerIpcHandlers(): void {
           })
 
       activeCaptureMeetingId = meeting.id
+      capturePaused = false
       const settings = store.getSettings()
       const resolved = resolveSttAndDiarize(settings)
 
@@ -716,8 +725,16 @@ function registerIpcHandlers(): void {
       })
       activeCaptureSession = session
 
+      session.on('audio', (chunk: { sysRMS?: number; micRMS?: number }) => {
+        if (!capturePaused) {
+          const level = Math.max(chunk.sysRMS ?? 0, chunk.micRMS ?? 0)
+          broadcast('audio:level', { level })
+        }
+      })
+
       ;(async () => {
         for await (const ev of session.events) {
+          if (capturePaused) continue
           if (ev.type === 'transcript') {
             const cleanedText = cleanWhisperText(ev.text)
             if (!ev.partial && cleanedText) {
@@ -764,6 +781,61 @@ function registerIpcHandlers(): void {
     },
   )
 
+  ipcMain.handle('nectar:pauseCapture', async () => {
+    capturePaused = true
+    if (activeCaptureSession && 'pause' in activeCaptureSession) {
+      ;(activeCaptureSession as unknown as { pause(): void }).pause()
+    }
+    broadcast('audio:level', { level: 0 })
+    const state = await getFullAppState()
+    broadcast('state:refresh', state)
+    return state
+  })
+
+  ipcMain.handle('nectar:resumeCapture', async () => {
+    capturePaused = false
+    if (activeCaptureSession && 'resume' in activeCaptureSession) {
+      ;(activeCaptureSession as unknown as { resume(): void }).resume()
+    }
+    const state = await getFullAppState()
+    broadcast('state:refresh', state)
+    return state
+  })
+
+  ipcMain.handle('nectar:focusMainWindow', async () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    }
+    return { ok: true }
+  })
+
+  ipcMain.on('nectar:startPillDrag', () => {
+    if (pillWindow && !pillWindow.isDestroyed()) {
+      const cursor = screen.getCursorScreenPoint()
+      const bounds = pillWindow.getBounds()
+      pillDragOffset = {
+        x: cursor.x - bounds.x,
+        y: cursor.y - bounds.y,
+      }
+    }
+  })
+
+  ipcMain.on('nectar:dragPill', () => {
+    if (pillWindow && !pillWindow.isDestroyed() && pillDragOffset) {
+      const cursor = screen.getCursorScreenPoint()
+      const bounds = pillWindow.getBounds()
+      const clamped = clampPillBounds(
+        cursor.x - pillDragOffset.x,
+        cursor.y - pillDragOffset.y,
+        bounds.width,
+        bounds.height,
+      )
+      pillWindow.setPosition(clamped.x, clamped.y, false)
+    }
+  })
+
   ipcMain.handle('nectar:stopCapture', async () => {
     if (simulationTimer) {
       clearInterval(simulationTimer)
@@ -775,6 +847,8 @@ function registerIpcHandlers(): void {
     }
     const stoppedMeetingId = activeCaptureMeetingId
     activeCaptureMeetingId = null
+    capturePaused = false
+    broadcast('audio:level', { level: 0 })
     if (stoppedMeetingId) {
       store.updateMeeting(stoppedMeetingId, {
         status: 'completed',
@@ -802,6 +876,7 @@ function registerIpcHandlers(): void {
         '- Reviewing Cortex 0.1.0 memory footprint on M4 Max\n- Confirming who owns vector-indexer migration\n- [ ] Rishi: Benchmark TTFT with Gemma 4 E2B Q4_K_M',
     })
     activeCaptureMeetingId = meeting.id
+    capturePaused = false
     broadcast('state:refresh', await getFullAppState())
 
     const script = [
@@ -828,12 +903,15 @@ function registerIpcHandlers(): void {
     let idx = 0
     const settings = store.getSettings()
     simulationTimer = setInterval(async () => {
+      if (capturePaused) return
       if (idx >= script.length) {
         if (simulationTimer) {
           clearInterval(simulationTimer)
           simulationTimer = null
         }
         activeCaptureMeetingId = null
+        capturePaused = false
+        broadcast('audio:level', { level: 0 })
         const full = store.getMeeting(meeting.id)!
         const distilled = await distillMeeting(full, settings, cortexUrl)
         store.updateMeeting(meeting.id, {
@@ -863,6 +941,7 @@ function registerIpcHandlers(): void {
       }
 
       const item = script[idx++]!
+      broadcast('audio:level', { level: 0.28 })
       const turn = store.addTranscriptTurn({
         meetingId: meeting.id,
         speaker: item.speaker,
@@ -1062,6 +1141,76 @@ async function createWindow(): Promise<void> {
   }
 }
 
+function clampPillBounds(
+  rawX: number,
+  rawY: number,
+  width: number,
+  height: number,
+): { x: number; y: number } {
+  const displays = screen.getAllDisplays()
+  const margin = 6
+
+  // Global horizontal span across all connected displays
+  const globalMinX = Math.min(...displays.map((d) => d.bounds.x)) + margin
+  const globalMaxX =
+    Math.max(...displays.map((d) => d.bounds.x + d.bounds.width)) - width - margin
+
+  const nextX = Math.max(globalMinX, Math.min(globalMaxX, Math.round(rawX)))
+  const centerX = nextX + Math.round(width / 2)
+  const centerY = Math.round(rawY + height / 2)
+
+  // Find the display that owns this horizontal X position
+  const activeDisplay =
+    displays.find(
+      (d) => centerX >= d.bounds.x && centerX <= d.bounds.x + d.bounds.width,
+    ) ?? screen.getDisplayNearestPoint({ x: centerX, y: centerY })
+
+  const topLimit = activeDisplay.workArea.y + margin
+  const bottomLimit =
+    activeDisplay.bounds.y + activeDisplay.bounds.height - height - margin
+  const nextY = Math.max(topLimit, Math.min(bottomLimit, Math.round(rawY)))
+
+  return { x: nextX, y: nextY }
+}
+
+async function createPillWindow(): Promise<void> {
+  const display = screen.getPrimaryDisplay()
+  const db = display.bounds
+  const pillWidth = 40
+  const pillHeight = 136
+  const margin = 6
+
+  pillWindow = new BrowserWindow({
+    width: pillWidth,
+    height: pillHeight,
+    x: db.x + db.width - pillWidth - margin,
+    y: db.y + db.height - pillHeight - margin,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    resizable: false,
+    movable: false,
+    hasShadow: false,
+    skipTaskbar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+
+  pillWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+
+  const devUrl = process.env.VITE_DEV_SERVER_URL
+  if (devUrl) {
+    await pillWindow.loadURL(`${devUrl}?view=pill`)
+  } else {
+    await pillWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
+      search: 'view=pill',
+    })
+  }
+}
+
 app.whenReady().then(async () => {
   store = new NectarStore()
   // Sanitize any existing transcript turns and meeting summaries that contained raw Whisper <|...|> tokens
@@ -1101,6 +1250,7 @@ app.whenReady().then(async () => {
 
   registerIpcHandlers()
   await createWindow()
+  await createPillWindow()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

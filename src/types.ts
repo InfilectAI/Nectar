@@ -136,6 +136,7 @@ export interface AppState {
   cortexPrimitives: Record<string, string>
   detectedMeetings: MeetingTarget[]
   activeCaptureMeetingId: string | null
+  capturePaused: boolean
   permissions: Record<string, string>
   meetings: MeetingRecord[]
   graph: {
@@ -171,8 +172,13 @@ declare global {
       deleteMeeting(id: string): Promise<{ ok: boolean }>
       distillMeeting(id: string): Promise<MeetingRecord>
       startCapture(target?: MeetingTarget, meetingId?: string): Promise<MeetingRecord>
+      pauseCapture(): Promise<AppState>
+      resumeCapture(): Promise<AppState>
       stopCapture(): Promise<AppState>
       simulateLiveMeeting(): Promise<MeetingRecord>
+      focusMainWindow(): Promise<{ ok: boolean }>
+      startPillDrag(): void
+      dragPill(): void
       recall(query: string): Promise<RecallResult>
       getKnowledgeGraph(includeSuperseded?: boolean): Promise<AppState['graph']>
       consolidateMemory(): Promise<unknown>
