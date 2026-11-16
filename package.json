@@ -14,6 +14,7 @@
     "build:vite": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json && cp electron/preload.cjs dist-electron/preload.cjs",
     "build": "npm run build:vite && npm run build:electron",
+    "dist:dmg": "npm run build && electron-builder --mac dmg --arm64 --publish never",
     "start": "npm run build && electron ."
   },
   "repository": {
@@ -39,8 +40,48 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^35.0.0",
+    "electron-builder": "^25.1.8",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0",
     "vite": "^6.0.0"
+  },
+  "build": {
+    "appId": "ai.infilect.nectar",
+    "productName": "Nectar",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "bin/**/*",
+      "public/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/@infilectai/aira/bin/**",
+      "node_modules/@infilectai/cortex/bin/**",
+      "bin/**"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "identity": null,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Nectar uses the microphone to capture and attribute your voice during meetings.",
+        "NSAccessibilityUsageDescription": "Nectar uses Accessibility to detect active meeting windows and participants.",
+        "NSAppleEventsUsageDescription": "Nectar uses Apple Events to inspect active meeting tabs when permitted."
+      }
+    },
+    "dmg": {
+      "artifactName": "Nectar-${version}-${arch}.${ext}"
+    }
   }
 }

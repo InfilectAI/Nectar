@@ -34,6 +34,12 @@ let pillDragOffset: { x: number; y: number } | null = null
 let mcpServer: McpHttpServer
 let simulationTimer: NodeJS.Timeout | null = null
 
+function unpackPath(p: string): string {
+  return p.includes('app.asar') && !p.includes('app.asar.unpacked')
+    ? p.replace('app.asar', 'app.asar.unpacked')
+    : p
+}
+
 function cleanWhisperText(raw: string): string {
   return raw
     .replace(/<\|[^|]*\|>/g, ' ')
@@ -359,7 +365,21 @@ async function initComputeAndPerception(settings: NectarSettings): Promise<void>
   // Initialize Aira for meeting detection & audio capture
   if (!aira) {
     const resolved = resolveSttAndDiarize(settings)
+    const packedCaptureCandidate = unpackPath(
+      path.resolve(
+        __dirname,
+        '..',
+        'node_modules',
+        '@infilectai',
+        'aira',
+        'bin',
+        'aira-capture',
+      ),
+    )
     aira = await Aira.create({
+      capturePath: fs.existsSync(packedCaptureCandidate)
+        ? packedCaptureCandidate
+        : undefined,
       stt: resolved.stt,
       diarize: resolved.diarize,
     })
@@ -578,7 +598,9 @@ async function getFullAppState() {
       port: mcpServer.port,
       tools: MCP_TOOLS,
       requestsHandled: mcpServer.requestsHandled,
-      stdioScriptPath: path.resolve(__dirname, '..', 'bin', 'nectar-mcp.js'),
+      stdioScriptPath: unpackPath(
+        path.resolve(__dirname, '..', 'bin', 'nectar-mcp.js'),
+      ),
       installed: getMcpInstalledState(),
     },
   }
@@ -1015,7 +1037,9 @@ function registerIpcHandlers(): void {
       target: 'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode',
     ) => {
       const home = os.homedir()
-      const stdioScriptPath = path.resolve(__dirname, '..', 'bin', 'nectar-mcp.js')
+      const stdioScriptPath = unpackPath(
+        path.resolve(__dirname, '..', 'bin', 'nectar-mcp.js'),
+      )
 
       const mergeJsonMcp = (
         filePath: string,
