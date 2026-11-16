@@ -5,7 +5,6 @@ import {
   Copy,
   Cpu,
   MessageSquareText,
-  Mic,
   Play,
   Plus,
   Radio,
@@ -20,6 +19,7 @@ import {
   AgentIcon,
   type McpAgentId,
 } from './components/AgentIcons'
+import { GranolaHandle } from './components/GranolaHandle'
 import type {
   AppState,
   MeetingRecord,
@@ -75,10 +75,18 @@ export default function App() {
   const [livePartial, setLivePartial] = useState<{ speaker: string; text: string } | null>(
     null,
   )
+  const [audioLevel, setAudioLevel] = useState(0)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [settingsDraft, setSettingsDraft] = useState<NectarSettings | null>(null)
 
+  const isPillOverlay =
+    typeof window !== 'undefined' && window.location.search.includes('view=pill')
+
   useEffect(() => {
+    if (isPillOverlay) {
+      document.documentElement.style.background = 'transparent'
+      document.body.style.background = 'transparent'
+    }
     window.nectar.getState().then((initial) => {
       setState(initial)
       setSettingsDraft(initial.settings)
@@ -92,6 +100,8 @@ export default function App() {
         const next = ev as unknown as AppState
         setState(next)
         setSettingsDraft(next.settings)
+      } else if (ev.type === 'audio:level') {
+        setAudioLevel(Number(ev.level ?? 0))
       } else if (ev.type === 'meetings:changed') {
         const meetings = ev.meetings as MeetingRecord[]
         setState((prev) => (prev ? { ...prev, meetings } : prev))
@@ -153,39 +163,6 @@ export default function App() {
   const isRecordingThisMeeting =
     selectedMeeting && state.activeCaptureMeetingId === selectedMeeting.id
 
-  const handleToggleMode = async (mode: 'local' | 'cloud') => {
-    const port = state.settings.localPort || 8000
-    const preset: Partial<NectarSettings> =
-      mode === 'local'
-        ? {
-            mode: 'local',
-            sttUrl: `http://127.0.0.1:${port}/v1/audio/transcriptions`,
-            sttModel: 'whisper-large-v3',
-            diarizeUrl: `http://127.0.0.1:${port}/v1/audio/diarize`,
-            diarizeModel: 'pyannote-speakerkit',
-            llmBaseUrl: `http://127.0.0.1:${port}/v1`,
-            llmModel: 'gemma-4-E2B-it',
-            embeddingBaseUrl: `http://127.0.0.1:${port}/v1`,
-            embeddingModel: 'embeddinggemma-300M',
-            embeddingDimensions: 768,
-          }
-        : {
-            mode: 'cloud',
-            sttUrl: 'https://api.openai.com/v1/audio/transcriptions',
-            sttModel: 'whisper-1',
-            diarizeUrl: `http://127.0.0.1:${port}/v1/audio/diarize`,
-            diarizeModel: 'pyannote-speakerkit',
-            llmBaseUrl: 'https://api.openai.com/v1',
-            llmModel: 'gpt-4o-mini',
-            embeddingBaseUrl: 'https://api.openai.com/v1',
-            embeddingModel: 'text-embedding-3-small',
-            embeddingDimensions: 1536,
-          }
-    const next = await window.nectar.saveSettings(preset)
-    setState(next)
-    setSettingsDraft(next.settings)
-  }
-
   const handleCreateNote = async () => {
     const created = await window.nectar.createMeeting({
       title: 'Untitled Meeting',
@@ -213,11 +190,50 @@ export default function App() {
   }
 
   const handleStopCapture = async () => {
+    const activeId = state.activeCaptureMeetingId ?? selectedMeeting?.id ?? null
     const next = await window.nectar.stopCapture()
     setState(next)
-    if (selectedMeeting) {
-      await handleDistill(selectedMeeting.id)
+    if (activeId) {
+      await handleDistill(activeId)
     }
+  }
+
+  const handlePauseCapture = async () => {
+    const next = await window.nectar.pauseCapture()
+    setState(next)
+  }
+
+  const handleResumeCapture = async () => {
+    const next = await window.nectar.resumeCapture()
+    setState(next)
+  }
+
+  const handleStatus: 'idle' | 'recording' | 'paused' = state.activeCaptureMeetingId
+    ? state.capturePaused
+      ? 'paused'
+      : 'recording'
+    : 'idle'
+
+  if (isPillOverlay) {
+    return (
+      <div className="flex h-screen w-screen items-end justify-center pb-0.5 bg-transparent overflow-hidden">
+        <GranolaHandle
+          status={handleStatus}
+          meetingDetected={state.detectedMeetings.length > 0}
+          audioLevel={audioLevel}
+          onStart={() =>
+            window.nectar.startCapture(
+              state.detectedMeetings[0],
+              selectedMeeting?.id,
+            )
+          }
+          onPause={handlePauseCapture}
+          onResume={handleResumeCapture}
+          onStop={handleStopCapture}
+          onOpenApp={() => window.nectar.focusMainWindow()}
+        />
+      </div>
+    )
   }
 
   const handleDistill = async (id: string) => {
@@ -425,7 +441,7 @@ export default function App() {
         <main className="flex flex-1 overflow-hidden bg-well">
           {selectedMeeting ? (
             <div className="flex flex-1 overflow-hidden">
-              <div className="flex flex-1 flex-col overflow-hidden">
+              <div className="relative flex flex-1 flex-col overflow-hidden">
                 {/* Note Header & Toolbar */}
                 <div className="flex items-center justify-between border-b border-rail px-8 py-4 bg-recessed/50">
                   <div className="flex-1 pr-4">
@@ -456,6 +472,18 @@ export default function App() {
                           <span>{selectedMeeting.participants.join(', ')}</span>
                         </>
                       )}
+                      {isRecordingThisMeeting && (
+                        <>
+                          <span>·</span>
+                          <span
+                            className={`font-semibold ${
+                              state.capturePaused ? 'text-amber' : 'text-emerald-700'
+                            }`}
+                          >
+                            {state.capturePaused ? 'Paused' : 'Recording'}
+                          </span>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -483,26 +511,6 @@ export default function App() {
                         Summary
                       </button>
                     </div>
-
-                    {!isRecordingThisMeeting ? (
-                      <button
-                        onClick={() =>
-                          window.nectar.startCapture(undefined, selectedMeeting.id)
-                        }
-                        className="inline-flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-3 py-1.5 font-mono text-[11px] font-medium text-ink hover:border-ink/40"
-                      >
-                        <Mic className="h-3.5 w-3.5 text-signal" />
-                        Record
-                      </button>
-                    ) : (
-                      <button
-                        onClick={handleStopCapture}
-                        className="inline-flex items-center gap-1.5 rounded-[4px] bg-signal px-3 py-1.5 font-mono text-[11px] font-semibold text-white hover:bg-signal-bright"
-                      >
-                        <Square className="h-3 w-3 fill-current" />
-                        Stop
-                      </button>
-                    )}
 
                     <button
                       onClick={() => handleDistill(selectedMeeting.id)}
