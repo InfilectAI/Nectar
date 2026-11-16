@@ -39,6 +39,11 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
+      # Check the app users download: a broken signature makes macOS report it
+      # as "damaged" with no way to allow it.
+      - name: Verify the DMG's app is ad-hoc signed
+        run: scripts/verify-dmg.sh release/*.dmg
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:

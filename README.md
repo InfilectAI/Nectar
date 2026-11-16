@@ -53,6 +53,10 @@ Copy directly from **Settings → Local MCP Server** in the app, or add:
 - **macOS 14.2+** (Apple Silicon `arm64`)
 - **Node.js 22.5+**
 
+### Install
+
+Download `Nectar-<version>-arm64.dmg` from [Releases](https://github.com/InfilectAI/Nectar/releases) and drag Nectar to Applications. The app is ad-hoc signed and not notarized by Apple, so the first launch is blocked: open **System Settings → Privacy & Security** and choose **Open Anyway**.
+
 ### Run Locally
 
 ```bash
