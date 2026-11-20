@@ -8,6 +8,9 @@ import { afterEach, describe, it } from 'node:test'
 import { WebSocketServer } from 'ws'
 
 import {
+  validateCloudSettings,
+} from '../dist-electron/cloud-validator.js'
+import {
   resolveEmbeddingEndpoint,
   resolveLlmEndpoint,
 } from '../dist-electron/distiller.js'
@@ -296,3 +299,101 @@ describe('StreamingWsSession', () => {
     }
   })
 })
+
+describe('Cloud API smoke-test validator & legacy preset cleanup', () => {
+  it('strips legacy local Cortex URLs and models while preserving custom endpoints', () => {
+    const cleaned = normalizeSettings({
+      sttUrl: 'http://127.0.0.1:8000/v1/audio/transcriptions',
+      sttModel: 'whisper-large-v3',
+      diarizeUrl: 'http://127.0.0.1:8000/v1/audio/diarize',
+      llmBaseUrl: 'http://127.0.0.1:8000/v1',
+      llmModel: 'gemma-4-E2B-it',
+      embeddingBaseUrl: 'http://127.0.0.1:8000/v1',
+      embeddingModel: 'embeddinggemma-300M',
+    })
+    assert.equal(cleaned.sttUrl, '')
+    assert.equal(cleaned.sttModel, '')
+    assert.equal(cleaned.diarizeUrl, '')
+    assert.equal(cleaned.llmBaseUrl, '')
+    assert.equal(cleaned.llmModel, '')
+    assert.equal(cleaned.embeddingBaseUrl, '')
+    assert.equal(cleaned.embeddingModel, '')
+
+    const custom = normalizeSettings({
+      llmBaseUrl: 'http://localhost:11434/v1',
+      llmModel: 'llama3.2',
+    })
+    assert.equal(custom.llmBaseUrl, 'http://localhost:11434/v1')
+    assert.equal(custom.llmModel, 'llama3.2')
+  })
+
+  it('validates cloud LLM & embedding endpoints and catches bad auth before save', async () => {
+    const server = http.createServer((req, res) => {
+      const auth = req.headers.authorization
+      if (auth !== 'Bearer good-key') {
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }))
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      if (req.url === '/v1/chat/completions') {
+        res.end(JSON.stringify({ choices: [{ message: { content: 'pong' } }] }))
+      } else if (req.url === '/v1/embeddings') {
+        res.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }))
+      } else {
+        res.writeHead(404)
+        res.end()
+      }
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    const base = `http://127.0.0.1:${port}/v1`
+
+    try {
+      const okRes = await validateCloudSettings(
+        normalizeSettings({
+          sttMode: 'local',
+          diarizeMode: 'local',
+          llmMode: 'cloud',
+          embeddingMode: 'cloud',
+          cloudAiProvider: 'openai-compatible',
+          llmBaseUrl: base,
+          llmModel: 'test-chat',
+          llmApiKey: 'good-key',
+          llmAuthScheme: 'Bearer',
+          embeddingBaseUrl: base,
+          embeddingModel: 'test-embed',
+          embeddingApiKey: 'good-key',
+          embeddingAuthScheme: 'Bearer',
+        }),
+      )
+      assert.equal(okRes.ok, true)
+      const byService = Object.fromEntries(okRes.results.map((r) => [r.service, r]))
+      assert.equal(byService.stt.skipped, true)
+      assert.equal(byService.llm.ok, true)
+      assert.equal(byService.embedding.ok, true)
+      assert.match(byService.embedding.message, /3d/)
+
+      const badRes = await validateCloudSettings(
+        normalizeSettings({
+          sttMode: 'local',
+          diarizeMode: 'local',
+          llmMode: 'cloud',
+          embeddingMode: 'local',
+          cloudAiProvider: 'openai-compatible',
+          llmBaseUrl: base,
+          llmModel: 'test-chat',
+          llmApiKey: 'wrong-key',
+          llmAuthScheme: 'Bearer',
+        }),
+      )
+      assert.equal(badRes.ok, false)
+      const llmErr = badRes.results.find((r) => r.service === 'llm')
+      assert.equal(llmErr.ok, false)
+      assert.match(llmErr.message, /401.*Invalid API key/)
+    } finally {
+      server.close()
+    }
+  })
+})
+

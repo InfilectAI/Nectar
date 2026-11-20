@@ -173,6 +173,29 @@ interface LegacySettingsFields {
   cloudAiApiKey?: string
 }
 
+const LEGACY_LOCAL_MODELS = new Set([
+  'whisper-large-v3',
+  'pyannote-speakerkit',
+  'gemma-4-E2B-it',
+  'embeddinggemma-300M',
+])
+
+const LEGACY_LOCAL_URLS = new Set([
+  'http://127.0.0.1:8000/v1',
+  'http://127.0.0.1:8000/v1/audio/transcriptions',
+  'http://127.0.0.1:8000/v1/audio/diarize',
+])
+
+function stripLegacyLocalUrl(url?: string): string {
+  const trimmed = (url ?? '').trim()
+  return LEGACY_LOCAL_URLS.has(trimmed) ? '' : trimmed
+}
+
+function stripLegacyLocalModel(model?: string): string {
+  const trimmed = (model ?? '').trim()
+  return LEGACY_LOCAL_MODELS.has(trimmed) ? '' : trimmed
+}
+
 export function normalizeSettings(
   raw: Partial<NectarSettings> & LegacySettingsFields,
 ): NectarSettings {
@@ -184,11 +207,17 @@ export function normalizeSettings(
     diarizeMode: raw.diarizeMode ?? fallbackMode,
     llmMode: raw.llmMode ?? fallbackMode,
     embeddingMode: raw.embeddingMode ?? fallbackMode,
-    sttModel: raw.sttModel || raw.cloudSttModel || '',
+    sttUrl: stripLegacyLocalUrl(raw.sttUrl),
+    diarizeUrl: stripLegacyLocalUrl(raw.diarizeUrl),
+    llmBaseUrl: stripLegacyLocalUrl(raw.llmBaseUrl),
+    embeddingBaseUrl: stripLegacyLocalUrl(raw.embeddingBaseUrl),
+    sttModel: stripLegacyLocalModel(raw.sttModel || raw.cloudSttModel),
     sttApiKey: raw.sttApiKey || raw.cloudSttApiKey || '',
-    llmModel: raw.llmModel || raw.cloudLlmModel || '',
+    llmModel: stripLegacyLocalModel(raw.llmModel || raw.cloudLlmModel),
     llmApiKey: raw.llmApiKey || raw.cloudAiApiKey || '',
-    embeddingModel: raw.embeddingModel || raw.cloudEmbeddingModel || '',
+    embeddingModel: stripLegacyLocalModel(
+      raw.embeddingModel || raw.cloudEmbeddingModel,
+    ),
   }
   merged.mode = computeOverallMode(merged)
   return merged
