@@ -8,6 +8,7 @@ import { Aira, type EyesSession, type MeetingTarget, type MeetingWatcher, type S
 import { Cortex, type CortexServer } from '@infilectai/cortex'
 import { SourceEvent, SourceType, Synapse } from '@infilectai/synapse'
 
+import { validateCloudSettings } from './cloud-validator.js'
 import {
   deterministicDistill,
   distillMeeting,
@@ -30,6 +31,7 @@ import {
   anyServiceUsesLocal,
   getEffectiveServiceModes,
   getNectarDataDir,
+  normalizeSettings,
   type AuthScheme,
   type MeetingRecord,
   type NectarSettings,
@@ -45,6 +47,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 let mainWindow: BrowserWindow | null = null
+let mainWindowPromise: Promise<void> | null = null
 let pillWindow: BrowserWindow | null = null
 let store: NectarStore
 let synapse: Synapse
@@ -68,6 +71,7 @@ let streamingWsStatus: StreamingWsStatus = {
   error: null,
 }
 let activeCaptureMeetingId: string | null = null
+let activeCaptureKind: 'meeting' | 'self-note' | null = null
 let capturePaused = false
 let pillDragOffset: { x: number; y: number } | null = null
 let mcpServer: McpHttpServer
@@ -809,6 +813,7 @@ async function getFullAppState() {
     streamingWs: streamingWsStatus,
     detectedMeetings,
     activeCaptureMeetingId,
+    activeCaptureKind,
     capturePaused,
     permissions,
     meetings,
@@ -950,6 +955,13 @@ function registerIpcHandlers(): void {
   )
 
   ipcMain.handle(
+    'nectar:validateCloudSettings',
+    async (_e, draft: Partial<NectarSettings>) => {
+      return validateCloudSettings(normalizeSettings(draft))
+    },
+  )
+
+  ipcMain.handle(
     'nectar:createMeeting',
     async (
       _e,
@@ -1021,23 +1033,34 @@ function registerIpcHandlers(): void {
     return updated
   })
 
-  ipcMain.handle(
-    'nectar:startCapture',
-    async (_e, target?: MeetingTarget, existingMeetingId?: string) => {
-      if (!aira) throw new Error('Aira SDK not initialized')
-      const perms = await aira.checkPermissions(true).catch(() => ({}))
-      broadcast('permissions:changed', { permissions: perms })
+  const beginCapture = async (opts: {
+    kind: 'meeting' | 'self-note'
+    target?: MeetingTarget
+    existingMeetingId?: string
+  }) => {
+    if (!aira) throw new Error('Aira SDK not initialized')
+    const perms = await aira.checkPermissions(true).catch(() => ({}))
+    broadcast('permissions:changed', { permissions: perms })
 
-      if (activeStreamingWs) {
-        await activeStreamingWs.finish().catch(() => {})
-        activeStreamingWs = null
-      }
-      if (activeCaptureSession) {
-        await activeCaptureSession.close().catch(() => {})
-        activeCaptureSession = null
-      }
+    if (activeStreamingWs) {
+      await activeStreamingWs.finish().catch(() => {})
+      activeStreamingWs = null
+    }
+    if (activeCaptureSession) {
+      await activeCaptureSession.close().catch(() => {})
+      activeCaptureSession = null
+    }
 
-      const resolvedTarget: MeetingTarget = target ??
+    const isSelfNote = opts.kind === 'self-note'
+    const resolvedTarget: MeetingTarget = isSelfNote
+      ? {
+          pid: 0,
+          browser: 'Nectar',
+          platform: 'self-note',
+          url: 'nectar://self-note',
+          title: 'Self Note',
+        }
+      : opts.target ??
         detectedMeetings[0] ?? {
           pid: process.pid,
           browser: 'chrome',
@@ -1046,155 +1069,191 @@ function registerIpcHandlers(): void {
           title: 'Live Meeting Capture',
         }
 
-      const meeting = existingMeetingId
-        ? store.getMeeting(existingMeetingId)!
-        : store.createMeeting({
-            title: resolvedTarget.title || 'Live Meeting',
-            platform: resolvedTarget.platform || 'google-meet',
-            url: resolvedTarget.url || 'nectar://live',
-            status: 'recording',
-          })
+    const existing = opts.existingMeetingId
+      ? store.getMeeting(opts.existingMeetingId)
+      : null
 
-      activeCaptureMeetingId = meeting.id
-      capturePaused = false
-      const settings = store.getSettings()
-      const resolved = resolveSttAndDiarize(settings)
+    const meeting = existing
+      ? store.updateMeeting(existing.id, { status: 'recording' })!
+      : store.createMeeting({
+          title: isSelfNote
+            ? 'Self Note'
+            : resolvedTarget.title || 'Live Meeting',
+          platform: isSelfNote
+            ? 'self-note'
+            : resolvedTarget.platform || 'google-meet',
+          url: isSelfNote
+            ? 'nectar://self-note'
+            : resolvedTarget.url || 'nectar://live',
+          status: 'recording',
+          participants: isSelfNote ? ['You'] : [],
+        })
 
-      if (resolved.useStreamingWs) {
-        const wsSession = new StreamingWsSession(
-          {
-            url: settings.sttUrl,
-            apiKey: settings.sttApiKey,
-            authScheme: settings.sttAuthScheme ?? 'Api-Key',
-            language: settings.sttLanguage || 'auto',
-            mode: settings.sttWsMode || 'meeting',
-            maxSpeakers: 8,
-          },
-          {
-            onStatus: (nextStatus) => {
-              streamingWsStatus = nextStatus
-              broadcast('streaming:status', { streamingWs: nextStatus })
-            },
-            onSegment: (seg) => {
-              const cleanedText = cleanWhisperText(seg.text)
-              if (!cleanedText) return
-              const turn = store.addTranscriptTurn({
-                meetingId: meeting.id,
-                speaker: seg.speaker || 'speaker_0',
-                participantId: seg.speaker || null,
-                text: cleanedText,
-                t0: seg.start,
-                t1: seg.end,
-              })
-              synapse
-                .ingest(
-                  {
-                    speaker: turn.speaker,
-                    participantId: turn.participantId,
-                    text: turn.text,
-                    t0: turn.t0,
-                    t1: turn.t1,
-                    partial: false,
-                    conversationId: meeting.id,
-                    sourceId: `turn-${turn.id}`,
-                  },
-                  settings.groupId,
-                )
-                .catch(() => {})
-              broadcast('meeting:turn', {
-                meetingId: meeting.id,
-                turn,
-                meeting: store.getMeeting(meeting.id),
-              })
-            },
-            onPartial: (partial) => {
-              if (!partial) {
-                broadcast('meeting:partial', { meetingId: meeting.id, text: '' })
-                return
-              }
-              const cleanedText = cleanWhisperText(partial.text)
-              if (cleanedText) {
-                broadcast('meeting:partial', {
-                  meetingId: meeting.id,
-                  speaker: partial.speaker || 'speaker_0',
-                  text: cleanedText,
-                  t0: partial.start,
-                })
-              }
-            },
-          },
-        )
-        activeStreamingWs = wsSession
-        wsSession.start()
+    activeCaptureMeetingId = meeting.id
+    activeCaptureKind = opts.kind
+    capturePaused = false
+    const settings = store.getSettings()
+    const resolved = resolveSttAndDiarize(settings)
+
+    const appendDictatedTurn = async (
+      speaker: string,
+      participantId: string | null,
+      cleanedText: string,
+      t0: number,
+      t1: number,
+    ) => {
+      const finalSpeaker = isSelfNote ? 'You' : speaker
+      const turn = store.addTranscriptTurn({
+        meetingId: meeting.id,
+        speaker: finalSpeaker,
+        participantId: isSelfNote ? 'local' : participantId,
+        text: cleanedText,
+        t0,
+        t1,
+      })
+
+      if (isSelfNote) {
+        const latest = store.getMeeting(meeting.id)
+        if (latest) {
+          const prev = latest.roughNotes.trimEnd()
+          const nextNotes = prev ? `${prev}\n${cleanedText}` : cleanedText
+          store.updateMeeting(meeting.id, { roughNotes: nextNotes })
+        }
       }
 
-      const session = aira.startMeeting(resolvedTarget, {
-        stt: resolved.stt,
-        diarize: resolved.diarize,
-      })
-      activeCaptureSession = session
+      synapse
+        .ingest(
+          {
+            speaker: turn.speaker,
+            participantId: turn.participantId,
+            text: turn.text,
+            t0: turn.t0,
+            t1: turn.t1,
+            partial: false,
+            conversationId: meeting.id,
+            sourceId: `turn-${turn.id}`,
+          },
+          settings.groupId,
+        )
+        .catch(() => {})
 
-      session.on(
-        'audio',
-        (chunk: { pcm?: Buffer; sysRMS?: number; micRMS?: number }) => {
-          if (!capturePaused) {
-            const level = Math.max(chunk.sysRMS ?? 0, chunk.micRMS ?? 0)
-            broadcast('audio:level', { level })
-            if (activeStreamingWs && chunk.pcm && chunk.pcm.length > 0) {
-              activeStreamingWs.feedPcm(chunk.pcm)
+      broadcast('meeting:turn', {
+        meetingId: meeting.id,
+        turn,
+        meeting: store.getMeeting(meeting.id),
+      })
+    }
+
+    if (resolved.useStreamingWs) {
+      const wsSession = new StreamingWsSession(
+        {
+          url: settings.sttUrl,
+          apiKey: settings.sttApiKey,
+          authScheme: settings.sttAuthScheme ?? 'Api-Key',
+          language: settings.sttLanguage || 'auto',
+          mode: settings.sttWsMode || 'meeting',
+          maxSpeakers: isSelfNote ? 1 : 8,
+        },
+        {
+          onStatus: (nextStatus) => {
+            streamingWsStatus = nextStatus
+            broadcast('streaming:status', { streamingWs: nextStatus })
+          },
+          onSegment: (seg) => {
+            const cleanedText = cleanWhisperText(seg.text)
+            if (!cleanedText) return
+            void appendDictatedTurn(
+              seg.speaker || 'speaker_0',
+              seg.speaker || null,
+              cleanedText,
+              seg.start,
+              seg.end,
+            )
+          },
+          onPartial: (partial) => {
+            if (!partial) {
+              broadcast('meeting:partial', { meetingId: meeting.id, text: '' })
+              return
             }
-          }
+            const cleanedText = cleanWhisperText(partial.text)
+            if (cleanedText) {
+              broadcast('meeting:partial', {
+                meetingId: meeting.id,
+                speaker: isSelfNote ? 'You' : partial.speaker || 'speaker_0',
+                text: cleanedText,
+                t0: partial.start,
+              })
+            }
+          },
         },
       )
+      activeStreamingWs = wsSession
+      wsSession.start()
+    }
 
-      if (!resolved.useStreamingWs) {
-        ;(async () => {
-          for await (const ev of session.events) {
-            if (capturePaused) continue
-            if (ev.type === 'transcript') {
-              const cleanedText = cleanWhisperText(ev.text)
-              if (!ev.partial && cleanedText) {
-                const turn = store.addTranscriptTurn({
-                  meetingId: meeting.id,
-                  speaker: ev.name || 'You',
-                  participantId: ev.participantId ?? null,
-                  text: cleanedText,
-                  t0: ev.t0,
-                  t1: ev.t1,
-                })
-                await synapse.ingest(
-                  {
-                    speaker: turn.speaker,
-                    participantId: turn.participantId,
-                    text: turn.text,
-                    t0: turn.t0,
-                    t1: turn.t1,
-                    partial: false,
-                    conversationId: meeting.id,
-                    sourceId: `turn-${turn.id}`,
-                  },
-                  settings.groupId,
-                )
-                broadcast('meeting:turn', {
-                  meetingId: meeting.id,
-                  turn,
-                  meeting: store.getMeeting(meeting.id),
-                })
-              } else if (ev.partial && cleanedText) {
-                broadcast('meeting:partial', {
-                  meetingId: meeting.id,
-                  speaker: ev.name || 'You',
-                  text: cleanedText,
-                  t0: ev.t0,
-                })
-              }
+    const session = aira.startMeeting(resolvedTarget, {
+      stt: resolved.stt,
+      diarize: isSelfNote ? undefined : resolved.diarize,
+    })
+    activeCaptureSession = session
+
+    session.on(
+      'audio',
+      (chunk: { pcm?: Buffer; sysRMS?: number; micRMS?: number }) => {
+        if (!capturePaused) {
+          const level = isSelfNote
+            ? chunk.micRMS ?? 0
+            : Math.max(chunk.sysRMS ?? 0, chunk.micRMS ?? 0)
+          broadcast('audio:level', { level })
+          if (activeStreamingWs && chunk.pcm && chunk.pcm.length > 0) {
+            activeStreamingWs.feedPcm(chunk.pcm)
+          }
+        }
+      },
+    )
+
+    if (!resolved.useStreamingWs) {
+      ;(async () => {
+        for await (const ev of session.events) {
+          if (capturePaused) continue
+          if (ev.type === 'transcript') {
+            const cleanedText = cleanWhisperText(ev.text)
+            if (!ev.partial && cleanedText) {
+              await appendDictatedTurn(
+                ev.name || 'You',
+                ev.participantId ?? null,
+                cleanedText,
+                ev.t0,
+                ev.t1,
+              )
+            } else if (ev.partial && cleanedText) {
+              broadcast('meeting:partial', {
+                meetingId: meeting.id,
+                speaker: isSelfNote ? 'You' : ev.name || 'You',
+                text: cleanedText,
+                t0: ev.t0,
+              })
             }
           }
-        })().catch(() => {})
-      }
+        }
+      })().catch(() => {})
+    }
 
-      broadcast('state:refresh', await getFullAppState())
-      return meeting
+    broadcast('state:refresh', await getFullAppState())
+    return meeting
+  }
+
+  ipcMain.handle(
+    'nectar:startCapture',
+    async (_e, target?: MeetingTarget, existingMeetingId?: string) => {
+      return beginCapture({ kind: 'meeting', target, existingMeetingId })
+    },
+  )
+
+  ipcMain.handle(
+    'nectar:startSelfNote',
+    async (_e, existingMeetingId?: string) => {
+      return beginCapture({ kind: 'self-note', existingMeetingId })
     },
   )
 
@@ -1220,11 +1279,7 @@ function registerIpcHandlers(): void {
   })
 
   ipcMain.handle('nectar:focusMainWindow', async () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show()
-      mainWindow.focus()
-    }
+    await showOrCreateMainWindow()
     return { ok: true }
   })
 
@@ -1275,6 +1330,7 @@ function registerIpcHandlers(): void {
     broadcast('streaming:status', { streamingWs: streamingWsStatus })
     const stoppedMeetingId = activeCaptureMeetingId
     activeCaptureMeetingId = null
+    activeCaptureKind = null
     capturePaused = false
     broadcast('audio:level', { level: 0 })
     if (stoppedMeetingId) {
@@ -1499,32 +1555,69 @@ function registerIpcHandlers(): void {
   )
 }
 
+async function showOrCreateMainWindow(): Promise<void> {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    app.focus({ steal: true })
+    mainWindow.focus()
+    return
+  }
+  await createWindow()
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show()
+    app.focus({ steal: true })
+    mainWindow.focus()
+  }
+}
+
 async function createWindow(): Promise<void> {
-  const iconPath = path.join(__dirname, '..', 'public', 'icon.png')
-  if (fs.existsSync(iconPath)) {
-    app.dock?.setIcon(iconPath)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return
+  }
+  if (mainWindowPromise) {
+    return mainWindowPromise
   }
 
-  mainWindow = new BrowserWindow({
-    width: 1320,
-    height: 860,
-    minWidth: 1020,
-    minHeight: 680,
-    icon: fs.existsSync(iconPath) ? iconPath : undefined,
-    titleBarStyle: 'hiddenInset',
-    backgroundColor: '#F5F5F2',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  })
+  mainWindowPromise = (async () => {
+    const iconPath = path.join(__dirname, '..', 'public', 'icon.png')
+    if (fs.existsSync(iconPath)) {
+      app.dock?.setIcon(iconPath)
+    }
 
-  const devUrl = process.env.VITE_DEV_SERVER_URL
-  if (devUrl) {
-    await mainWindow.loadURL(devUrl)
-  } else {
-    await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    const win = new BrowserWindow({
+      width: 1320,
+      height: 860,
+      minWidth: 1020,
+      minHeight: 680,
+      icon: fs.existsSync(iconPath) ? iconPath : undefined,
+      titleBarStyle: 'hiddenInset',
+      backgroundColor: '#F5F5F2',
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    })
+    mainWindow = win
+    win.on('closed', () => {
+      if (mainWindow === win) {
+        mainWindow = null
+      }
+    })
+
+    const devUrl = process.env.VITE_DEV_SERVER_URL
+    if (devUrl) {
+      await win.loadURL(devUrl)
+    } else {
+      await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    }
+  })()
+
+  try {
+    await mainWindowPromise
+  } finally {
+    mainWindowPromise = null
   }
 }
 
@@ -1579,6 +1672,7 @@ async function createPillWindow(): Promise<void> {
     movable: false,
     hasShadow: false,
     skipTaskbar: true,
+    acceptFirstMouse: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -1642,9 +1736,7 @@ app.whenReady().then(async () => {
   await createPillWindow()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow()
-    }
+    void showOrCreateMainWindow()
   })
 })
 

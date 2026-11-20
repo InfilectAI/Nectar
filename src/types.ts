@@ -136,6 +136,21 @@ export interface MeetingTarget {
   title: string
 }
 
+export type CloudServiceKey = 'stt' | 'diarize' | 'llm' | 'embedding'
+
+export interface ServiceValidationResult {
+  service: CloudServiceKey
+  ok: boolean
+  skipped?: boolean
+  latencyMs: number
+  message: string
+}
+
+export interface CloudValidationResponse {
+  ok: boolean
+  results: ServiceValidationResult[]
+}
+
 export interface AppState {
   settings: NectarSettings
   cortexStatus: CortexRuntimeStatus
@@ -145,6 +160,7 @@ export interface AppState {
   streamingWs: StreamingWsStatus
   detectedMeetings: MeetingTarget[]
   activeCaptureMeetingId: string | null
+  activeCaptureKind: 'meeting' | 'self-note' | null
   capturePaused: boolean
   permissions: Record<string, string>
   meetings: MeetingRecord[]
@@ -183,6 +199,9 @@ declare global {
         language?: string
         mode?: 'meeting' | 'call'
       }): Promise<{ ok: boolean; latencyMs: number; message: string }>
+      validateCloudSettings(
+        draft: Partial<NectarSettings>,
+      ): Promise<CloudValidationResponse>
       createMeeting(input: {
         title?: string
         platform?: string
@@ -193,6 +212,7 @@ declare global {
       deleteMeeting(id: string): Promise<{ ok: boolean }>
       distillMeeting(id: string): Promise<MeetingRecord>
       startCapture(target?: MeetingTarget, meetingId?: string): Promise<MeetingRecord>
+      startSelfNote(meetingId?: string): Promise<MeetingRecord>
       pauseCapture(): Promise<AppState>
       resumeCapture(): Promise<AppState>
       stopCapture(): Promise<AppState>

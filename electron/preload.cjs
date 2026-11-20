@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('nectar', {
   restartCortex: () => ipcRenderer.invoke('nectar:restartCortex'),
   openModelsFolder: () => ipcRenderer.invoke('nectar:openModelsFolder'),
   testSttConnection: (config) => ipcRenderer.invoke('nectar:testSttConnection', config),
+  validateCloudSettings: (draft) =>
+    ipcRenderer.invoke('nectar:validateCloudSettings', draft),
 
   // Meetings & Notepad
   createMeeting: (input) => ipcRenderer.invoke('nectar:createMeeting', input),
@@ -27,6 +29,7 @@ contextBridge.exposeInMainWorld('nectar', {
   // Live Capture & Simulation
   startCapture: (target, meetingId) =>
     ipcRenderer.invoke('nectar:startCapture', target, meetingId),
+  startSelfNote: (meetingId) => ipcRenderer.invoke('nectar:startSelfNote', meetingId),
   pauseCapture: () => ipcRenderer.invoke('nectar:pauseCapture'),
   resumeCapture: () => ipcRenderer.invoke('nectar:resumeCapture'),
   stopCapture: () => ipcRenderer.invoke('nectar:stopCapture'),
