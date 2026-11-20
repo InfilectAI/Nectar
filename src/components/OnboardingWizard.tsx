@@ -3,15 +3,18 @@ import {
   ArrowLeft,
   ArrowRight,
   Check,
+  Loader2,
   ShieldCheck,
   Sparkles,
   X,
 } from 'lucide-react'
 import type {
   AppState,
+  CloudServiceKey,
   LocalModelId,
   LocalModelInfo,
   NectarSettings,
+  ServiceValidationResult,
 } from '../types'
 import {
   DownloadConfirmModal,
@@ -48,6 +51,11 @@ export function OnboardingWizard({
   const [step, setStep] = useState<1 | 2>(1)
   const [draft, setDraft] = useState<NectarSettings>(state.settings)
   const [saving, setSaving] = useState(false)
+  const [validating, setValidating] = useState(false)
+  const [validationResults, setValidationResults] = useState<
+    Partial<Record<CloudServiceKey, ServiceValidationResult>>
+  >({})
+  const [validationFailed, setValidationFailed] = useState(false)
   const [pendingDownloads, setPendingDownloads] = useState<LocalModelInfo[] | null>(
     null,
   )
@@ -61,6 +69,11 @@ export function OnboardingWizard({
 
   const micGranted = state.permissions?.microphone === 'granted'
   const axGranted = state.permissions?.accessibility === 'granted'
+
+  const handleDraftChange = (next: NectarSettings) => {
+    setDraft(next)
+    setValidationFailed(false)
+  }
 
   const persistAndAdvance = async (startModelIds?: LocalModelId[]) => {
     setSaving(true)
@@ -76,13 +89,35 @@ export function OnboardingWizard({
     }
   }
 
-  const handleContinueFromStep1 = async () => {
+  const proceedAfterValidation = async () => {
     const missing = getMissingSelectedLocalModels(draft, state.localModels)
     if (missing.length > 0) {
       setPendingDownloads(missing)
       return
     }
     await persistAndAdvance()
+  }
+
+  const handleContinueFromStep1 = async (skipValidation = false) => {
+    if (!skipValidation && cloudCount > 0) {
+      setValidating(true)
+      setValidationFailed(false)
+      try {
+        const res = await window.nectar.validateCloudSettings(draft)
+        const map: Partial<Record<CloudServiceKey, ServiceValidationResult>> = {}
+        for (const r of res.results) {
+          map[r.service] = r
+        }
+        setValidationResults(map)
+        if (!res.ok) {
+          setValidationFailed(true)
+          return
+        }
+      } finally {
+        setValidating(false)
+      }
+    }
+    await proceedAfterValidation()
   }
 
   const steps = [
@@ -173,10 +208,11 @@ export function OnboardingWizard({
 
                 <ServiceStackEditor
                   draft={draft}
-                  onChange={setDraft}
+                  onChange={handleDraftChange}
                   cortexStatus={state.cortexStatus}
                   cortexError={state.cortexError}
                   localModels={state.localModels}
+                  validationResults={validationResults}
                   onRefreshModels={onRefreshModels}
                   onRestartCortex={onRestartCortex}
                   onDownloadModel={onDownloadModel}
@@ -290,15 +326,33 @@ export function OnboardingWizard({
             </div>
 
             <div className="flex items-center gap-2">
+              {step === 1 && validationFailed && (
+                <button
+                  type="button"
+                  disabled={saving || validating}
+                  onClick={() => handleContinueFromStep1(true)}
+                  className="rounded-[4px] border border-rail bg-well px-3 py-1.5 font-mono text-[11px] text-muted hover:text-ink disabled:opacity-50"
+                >
+                  Continue Anyway
+                </button>
+              )}
+
               {step === 1 && (
                 <button
                   type="button"
-                  disabled={saving}
-                  onClick={handleContinueFromStep1}
+                  disabled={saving || validating}
+                  onClick={() => handleContinueFromStep1(false)}
                   className="inline-flex items-center gap-1.5 rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright disabled:opacity-50"
                 >
-                  <span>Continue</span>
-                  <ArrowRight className="h-3.5 w-3.5" />
+                  {validating && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  <span>
+                    {validating
+                      ? 'Validating…'
+                      : validationFailed
+                        ? 'Retry & Continue'
+                        : 'Continue'}
+                  </span>
+                  {!validating && <ArrowRight className="h-3.5 w-3.5" />}
                 </button>
               )}
 

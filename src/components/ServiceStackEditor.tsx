@@ -13,12 +13,14 @@ import {
 import type {
   AuthScheme,
   CloudAiProvider,
+  CloudServiceKey,
   CloudSttProvider,
   CortexRuntimeStatus,
   LocalModelId,
   LocalModelInfo,
   NectarSettings,
   ServiceMode,
+  ServiceValidationResult,
 } from '../types'
 import { formatBytes, formatSpeed } from '../utils/format'
 
@@ -28,11 +30,36 @@ interface ServiceStackEditorProps {
   cortexStatus: CortexRuntimeStatus
   cortexError: string | null
   localModels: LocalModelInfo[]
+  validationResults?: Partial<Record<CloudServiceKey, ServiceValidationResult>>
   onRefreshModels: () => void
   onRestartCortex: () => void
   onDownloadModel: (id: LocalModelId) => void
   onCancelDownload: (id: LocalModelId) => void
   onOpenModelsFolder: () => void
+}
+
+function CloudValidationInline({
+  result,
+}: {
+  result?: ServiceValidationResult
+}) {
+  if (!result || result.skipped) return null
+  return (
+    <div
+      className={`flex items-center gap-1.5 rounded-[3px] border px-2.5 py-1 font-mono text-[10px] ${
+        result.ok
+          ? 'border-emerald-700/30 bg-emerald-950/10 text-emerald-800'
+          : 'border-signal/40 bg-signal-tint text-signal'
+      }`}
+    >
+      {result.ok ? (
+        <CheckCircle2 className="h-3 w-3 shrink-0" />
+      ) : (
+        <AlertCircle className="h-3 w-3 shrink-0" />
+      )}
+      <span className="break-words">{result.message}</span>
+    </div>
+  )
 }
 
 function ModeToggle({
@@ -191,6 +218,7 @@ export function ServiceStackEditor({
   cortexStatus,
   cortexError,
   localModels,
+  validationResults,
   onRefreshModels,
   onRestartCortex,
   onDownloadModel,
@@ -401,11 +429,6 @@ export function ServiceStackEditor({
                     type="text"
                     value={draft.sttUrl}
                     onChange={(e) => patch({ sttUrl: e.target.value })}
-                    placeholder={
-                      draft.cloudSttProvider === 'websocket'
-                        ? 'wss://.../websocket'
-                        : 'https://.../v1/audio/transcriptions'
-                    }
                     className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                   />
                 </div>
@@ -418,7 +441,6 @@ export function ServiceStackEditor({
                     type="text"
                     value={draft.sttModel}
                     onChange={(e) => patch({ sttModel: e.target.value })}
-                    placeholder="e.g. nova-3, gpt-4o-transcribe"
                     className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                   />
                 </div>
@@ -463,7 +485,6 @@ export function ServiceStackEditor({
                   type="password"
                   value={draft.sttApiKey}
                   onChange={(e) => patch({ sttApiKey: e.target.value })}
-                  placeholder="Enter API key…"
                   className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                 />
               </div>
@@ -512,6 +533,8 @@ export function ServiceStackEditor({
                 {wsTestResult.message}
               </div>
             )}
+
+            <CloudValidationInline result={validationResults?.stt} />
 
             {/* Combine STT + Diarization Checkbox */}
             <label className="flex items-center gap-2 pt-0.5 cursor-pointer select-none">
@@ -585,48 +608,49 @@ export function ServiceStackEditor({
               onCancel={onCancelDownload}
             />
           ) : (
-            <div className="grid grid-cols-12 gap-2">
-              <div className="col-span-6">
-                <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                  Diarize Endpoint URL
-                </label>
-                <input
-                  type="text"
-                  value={draft.diarizeUrl}
-                  onChange={(e) => patch({ diarizeUrl: e.target.value })}
-                  placeholder="https://.../v1/audio/diarize"
-                  className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                />
+            <div className="space-y-2">
+              <div className="grid grid-cols-12 gap-2">
+                <div className="col-span-6">
+                  <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                    Diarize Endpoint URL
+                  </label>
+                  <input
+                    type="text"
+                    value={draft.diarizeUrl}
+                    onChange={(e) => patch({ diarizeUrl: e.target.value })}
+                    className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                  />
+                </div>
+                <div className="col-span-2">
+                  <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                    Auth
+                  </label>
+                  <select
+                    value={draft.diarizeAuthScheme}
+                    onChange={(e) =>
+                      patch({ diarizeAuthScheme: e.target.value as AuthScheme })
+                    }
+                    className="w-full rounded-[4px] border border-rail bg-well px-1.5 py-1 font-mono text-[11px]"
+                  >
+                    <option value="Api-Key">Api-Key</option>
+                    <option value="Bearer">Bearer</option>
+                    <option value="Token">Token</option>
+                    <option value="none">None</option>
+                  </select>
+                </div>
+                <div className="col-span-4">
+                  <label className="block font-mono text-[9.5px] text-muted mb-0.5">
+                    API Key
+                  </label>
+                  <input
+                    type="password"
+                    value={draft.diarizeApiKey}
+                    onChange={(e) => patch({ diarizeApiKey: e.target.value })}
+                    className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
+                  />
+                </div>
               </div>
-              <div className="col-span-2">
-                <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                  Auth
-                </label>
-                <select
-                  value={draft.diarizeAuthScheme}
-                  onChange={(e) =>
-                    patch({ diarizeAuthScheme: e.target.value as AuthScheme })
-                  }
-                  className="w-full rounded-[4px] border border-rail bg-well px-1.5 py-1 font-mono text-[11px]"
-                >
-                  <option value="Api-Key">Api-Key</option>
-                  <option value="Bearer">Bearer</option>
-                  <option value="Token">Token</option>
-                  <option value="none">None</option>
-                </select>
-              </div>
-              <div className="col-span-4">
-                <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                  API Key
-                </label>
-                <input
-                  type="password"
-                  value={draft.diarizeApiKey}
-                  onChange={(e) => patch({ diarizeApiKey: e.target.value })}
-                  placeholder="Optional if same as STT…"
-                  className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                />
-              </div>
+              <CloudValidationInline result={validationResults?.diarize} />
             </div>
           )}
         </div>
@@ -687,7 +711,6 @@ export function ServiceStackEditor({
                     type="text"
                     value={draft.llmBaseUrl}
                     onChange={(e) => patch({ llmBaseUrl: e.target.value })}
-                    placeholder="https://.../v1"
                     className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                   />
                 </div>
@@ -708,7 +731,6 @@ export function ServiceStackEditor({
                   type="text"
                   value={draft.llmModel}
                   onChange={(e) => patch({ llmModel: e.target.value })}
-                  placeholder="e.g. zai-org/GLM-5.3-Flash, gpt-4o-mini"
                   className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                 />
               </div>
@@ -739,11 +761,12 @@ export function ServiceStackEditor({
                   type="password"
                   value={draft.llmApiKey}
                   onChange={(e) => patch({ llmApiKey: e.target.value })}
-                  placeholder="Enter LLM API key…"
                   className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                 />
               </div>
             </div>
+
+            <CloudValidationInline result={validationResults?.llm} />
           </div>
         )}
       </div>
@@ -786,7 +809,6 @@ export function ServiceStackEditor({
                   type="text"
                   value={draft.embeddingBaseUrl}
                   onChange={(e) => patch({ embeddingBaseUrl: e.target.value })}
-                  placeholder="https://.../sync/v1"
                   className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                 />
               </div>
@@ -798,7 +820,6 @@ export function ServiceStackEditor({
                   type="text"
                   value={draft.embeddingModel}
                   onChange={(e) => patch({ embeddingModel: e.target.value })}
-                  placeholder="default"
                   className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                 />
               </div>
@@ -829,11 +850,12 @@ export function ServiceStackEditor({
                   type="password"
                   value={draft.embeddingApiKey}
                   onChange={(e) => patch({ embeddingApiKey: e.target.value })}
-                  placeholder="Separate embedding API key (optional)…"
                   className="w-full rounded-[4px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
                 />
               </div>
             </div>
+
+            <CloudValidationInline result={validationResults?.embedding} />
           </div>
         )}
       </div>
