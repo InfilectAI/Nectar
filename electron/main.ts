@@ -1500,11 +1500,17 @@ function registerIpcHandlers(): void {
 }
 
 async function createWindow(): Promise<void> {
+  const iconPath = path.join(__dirname, '..', 'public', 'icon.png')
+  if (fs.existsSync(iconPath)) {
+    app.dock?.setIcon(iconPath)
+  }
+
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 860,
     minWidth: 1020,
     minHeight: 680,
+    icon: fs.existsSync(iconPath) ? iconPath : undefined,
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#F5F5F2',
     webPreferences: {
