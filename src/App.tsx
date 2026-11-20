@@ -6,6 +6,7 @@ import {
   Download,
   Loader2,
   MessageSquareText,
+  Mic,
   Play,
   Plus,
   Radio,
@@ -31,11 +32,13 @@ import { OnboardingWizard } from './components/OnboardingWizard'
 import { ServiceStackEditor } from './components/ServiceStackEditor'
 import type {
   AppState,
+  CloudServiceKey,
   CortexRuntimeStatus,
   LocalModelId,
   LocalModelInfo,
   MeetingRecord,
   NectarSettings,
+  ServiceValidationResult,
   StreamingWsStatus,
 } from './types'
 
@@ -93,6 +96,11 @@ export default function App() {
   const [audioLevel, setAudioLevel] = useState(0)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [settingsDraft, setSettingsDraft] = useState<NectarSettings | null>(null)
+  const [validatingSettings, setValidatingSettings] = useState(false)
+  const [settingsValidationResults, setSettingsValidationResults] = useState<
+    Partial<Record<CloudServiceKey, ServiceValidationResult>>
+  >({})
+  const [settingsValidationFailed, setSettingsValidationFailed] = useState(false)
 
   const isPillOverlay =
     typeof window !== 'undefined' && window.location.search.includes('view=pill')
@@ -227,6 +235,15 @@ export default function App() {
     setShowTranscript(true)
   }
 
+  const handleStartSelfNote = async (existingMeetingId?: string) => {
+    const started = await window.nectar.startSelfNote(existingMeetingId)
+    const fresh = await window.nectar.getState()
+    setState(fresh)
+    setSelectedMeetingId(started.id)
+    setNoteTab('notes')
+    setShowTranscript(true)
+  }
+
   const handleStopCapture = async () => {
     const activeId = state.activeCaptureMeetingId ?? selectedMeeting?.id ?? null
     const next = await window.nectar.stopCapture()
@@ -259,12 +276,16 @@ export default function App() {
           status={handleStatus}
           meetingDetected={state.detectedMeetings.length > 0}
           audioLevel={audioLevel}
-          onStart={() =>
-            window.nectar.startCapture(
-              state.detectedMeetings[0],
-              selectedMeeting?.id,
-            )
-          }
+          onStart={() => {
+            if (state.detectedMeetings.length > 0) {
+              void window.nectar.startCapture(
+                state.detectedMeetings[0],
+                selectedMeeting?.id,
+              )
+            } else {
+              void window.nectar.startSelfNote()
+            }
+          }}
           onPause={handlePauseCapture}
           onResume={handleResumeCapture}
           onStop={handleStopCapture}
@@ -307,6 +328,8 @@ export default function App() {
 
   const openServicesSettings = () => {
     setSettingsDraft(state.settings)
+    setSettingsValidationResults({})
+    setSettingsValidationFailed(false)
     setShowSettingsModal(true)
     if (getSelectedLocalModelIds(state.settings).length > 0) {
       window.nectar.refreshLocalModels().catch(() => {})
@@ -364,8 +387,30 @@ export default function App() {
     setShowSettingsModal(false)
   }
 
-  const handleSaveSettingsModal = async () => {
+  const handleSaveSettingsModal = async (skipValidation = false) => {
     if (!settingsDraft) return
+    const localCount = getSelectedLocalModelIds(settingsDraft).length
+    const hasCloudServices = localCount < 4
+
+    if (!skipValidation && hasCloudServices) {
+      setValidatingSettings(true)
+      setSettingsValidationFailed(false)
+      try {
+        const res = await window.nectar.validateCloudSettings(settingsDraft)
+        const map: Partial<Record<CloudServiceKey, ServiceValidationResult>> = {}
+        for (const r of res.results) {
+          map[r.service] = r
+        }
+        setSettingsValidationResults(map)
+        if (!res.ok) {
+          setSettingsValidationFailed(true)
+          return
+        }
+      } finally {
+        setValidatingSettings(false)
+      }
+    }
+
     const missing = getMissingSelectedLocalModels(settingsDraft, localModels)
     if (missing.length > 0) {
       setPendingSettingsDownloads(missing)
@@ -524,7 +569,9 @@ export default function App() {
             <div className="flex items-center gap-2.5 rounded-[4px] border border-signal bg-signal-tint px-3 py-1">
               <span className="h-2 w-2 rounded-full bg-signal-bright animate-pulse" />
               <span className="font-mono text-[11px] font-semibold text-signal">
-                Recording meeting
+                {state.activeCaptureKind === 'self-note'
+                  ? 'Recording self note'
+                  : 'Recording meeting'}
               </span>
               <button
                 onClick={handleStopCapture}
@@ -583,18 +630,25 @@ export default function App() {
             <div className="flex gap-1.5">
               <button
                 onClick={handleCreateNote}
-                className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-[4px] bg-ink px-3 py-1.5 text-[12.5px] font-medium text-well hover:bg-signal-bright transition-colors"
+                className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-[4px] bg-ink px-2.5 py-1.5 text-[12px] font-medium text-well hover:bg-signal-bright transition-colors"
               >
                 <Plus className="h-3.5 w-3.5" />
                 New Note
               </button>
               <button
+                onClick={() => handleStartSelfNote()}
+                title="Dictate a self note with your microphone"
+                className="inline-flex items-center justify-center gap-1 rounded-[4px] border border-signal/40 bg-signal-tint px-2.5 py-1.5 font-mono text-[11px] font-semibold text-signal hover:bg-signal hover:text-white transition-colors"
+              >
+                <Mic className="h-3 w-3" />
+                Self Note
+              </button>
+              <button
                 onClick={handleSimulateLive}
                 title="Simulate a live call"
-                className="inline-flex items-center justify-center gap-1 rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11px] font-medium text-ink hover:border-ink/40"
+                className="inline-flex items-center justify-center rounded-[4px] border border-rail bg-well px-2 py-1.5 font-mono text-[11px] font-medium text-ink hover:border-ink/40"
               >
-                <Play className="h-3 w-3 text-signal fill-current" />
-                Demo
+                <Play className="h-3 w-3 text-muted fill-current" />
               </button>
             </div>
 
@@ -720,6 +774,25 @@ export default function App() {
                         Summary
                       </button>
                     </div>
+
+                    {!isRecordingThisMeeting ? (
+                      <button
+                        onClick={() => handleStartSelfNote(selectedMeeting.id)}
+                        title="Dictate voice directly into this note"
+                        className="inline-flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-3 py-1.5 font-mono text-[11px] font-medium text-ink hover:border-signal hover:text-signal"
+                      >
+                        <Mic className="h-3.5 w-3.5 text-signal" />
+                        Dictate
+                      </button>
+                    ) : (
+                      <button
+                        onClick={handleStopCapture}
+                        className="inline-flex items-center gap-1.5 rounded-[4px] bg-signal px-3 py-1.5 font-mono text-[11px] font-semibold text-white hover:bg-signal-bright"
+                      >
+                        <Square className="h-3 w-3 fill-current" />
+                        Stop
+                      </button>
+                    )}
 
                     <button
                       onClick={() => handleDistill(selectedMeeting.id)}
@@ -1063,10 +1136,14 @@ export default function App() {
             <div className="p-5 space-y-4 max-h-[78vh] overflow-y-auto">
               <ServiceStackEditor
                 draft={settingsDraft}
-                onChange={setSettingsDraft}
+                onChange={(next) => {
+                  setSettingsDraft(next)
+                  setSettingsValidationFailed(false)
+                }}
                 cortexStatus={state.cortexStatus}
                 cortexError={state.cortexError}
                 localModels={localModels}
+                validationResults={settingsValidationResults}
                 onRefreshModels={handleRefreshModels}
                 onRestartCortex={handleRestartCortex}
                 onDownloadModel={handleDownloadModel}
@@ -1159,11 +1236,30 @@ export default function App() {
                 >
                   Cancel
                 </button>
+                {settingsValidationFailed && (
+                  <button
+                    disabled={validatingSettings}
+                    onClick={() => handleSaveSettingsModal(true)}
+                    className="rounded-[4px] border border-rail bg-well px-3 py-1.5 font-mono text-[11.5px] text-muted hover:text-ink disabled:opacity-50"
+                  >
+                    Save Anyway
+                  </button>
+                )}
                 <button
-                  onClick={handleSaveSettingsModal}
-                  className="rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright"
+                  disabled={validatingSettings}
+                  onClick={() => handleSaveSettingsModal(false)}
+                  className="inline-flex items-center gap-1.5 rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright disabled:opacity-50"
                 >
-                  Save
+                  {validatingSettings && (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  )}
+                  <span>
+                    {validatingSettings
+                      ? 'Validating…'
+                      : settingsValidationFailed
+                        ? 'Retry Save'
+                        : 'Save'}
+                  </span>
                 </button>
               </div>
             </div>

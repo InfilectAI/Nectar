@@ -43,12 +43,16 @@ export function GranolaHandle({
   const [tick, setTick] = useState(0)
 
   const dragStateRef = useRef<{
-    dragging: boolean
+    pointerDown: boolean
+    captured: boolean
+    pointerId: number
     lastScreenX: number
     lastScreenY: number
     totalMove: number
   }>({
-    dragging: false,
+    pointerDown: false,
+    captured: false,
+    pointerId: -1,
     lastScreenX: 0,
     lastScreenY: 0,
     totalMove: 0,
@@ -65,9 +69,10 @@ export function GranolaHandle({
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return
-    e.currentTarget.setPointerCapture(e.pointerId)
     dragStateRef.current = {
-      dragging: true,
+      pointerDown: true,
+      captured: false,
+      pointerId: e.pointerId,
       lastScreenX: e.screenX,
       lastScreenY: e.screenY,
       totalMove: 0,
@@ -77,7 +82,7 @@ export function GranolaHandle({
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const st = dragStateRef.current
-    if (!st.dragging) return
+    if (!st.pointerDown) return
     const dx = e.screenX - st.lastScreenX
     const dy = e.screenY - st.lastScreenY
     if (dx === 0 && dy === 0) return
@@ -85,16 +90,32 @@ export function GranolaHandle({
     st.lastScreenX = e.screenX
     st.lastScreenY = e.screenY
     st.totalMove += Math.hypot(dx, dy)
-    window.nectar.dragPill()
+
+    // Only capture the pointer once movement exceeds the click threshold so child button clicks fire reliably
+    if (st.totalMove > 4) {
+      if (!st.captured) {
+        st.captured = true
+        try {
+          e.currentTarget.setPointerCapture(st.pointerId)
+        } catch {
+          // ignore
+        }
+      }
+      window.nectar.dragPill()
+    }
   }
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (dragStateRef.current.dragging) {
-      dragStateRef.current.dragging = false
-      try {
-        e.currentTarget.releasePointerCapture(e.pointerId)
-      } catch {
-        // ignore
+    const st = dragStateRef.current
+    if (st.pointerDown) {
+      st.pointerDown = false
+      if (st.captured) {
+        st.captured = false
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId)
+        } catch {
+          // ignore
+        }
       }
     }
   }
@@ -142,6 +163,7 @@ export function GranolaHandle({
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
       className="group relative flex flex-col items-center select-none cursor-grab active:cursor-grabbing"
     >
       <div
