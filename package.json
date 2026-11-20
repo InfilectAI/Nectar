@@ -14,6 +14,7 @@
     "build:vite": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json && cp electron/preload.cjs dist-electron/preload.cjs",
     "build": "npm run build:vite && npm run build:electron",
+    "test": "npm run build:electron && node --test tests/*.test.mjs",
     "dist:dmg": "npm run build && electron-builder --mac dmg --arm64 --publish never",
     "start": "npm run build && electron ."
   },
@@ -31,7 +32,8 @@
     "@infilectai/synapse": "^0.1.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",

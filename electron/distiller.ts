@@ -1,5 +1,6 @@
 import type { SemanticAssertions } from '@infilectai/synapse'
-import type { ActionItem, MeetingRecord, NectarSettings } from './store.js'
+import type { ActionItem, AuthScheme, MeetingRecord, NectarSettings, ServiceMode } from './store.js'
+import { buildAuthHeader } from './streaming-ws.js'
 
 export interface DistillResult {
   distilledNotes: string
@@ -29,49 +30,101 @@ return a JSON object with:
 5. "relationships": array of {"subjectKind": string, "subjectName": string, "predicate": "owns"|"assigned_to"|"decides"|"blocks"|"implements", "objectKind": string, "objectName": string}
 Output valid JSON only.`
 
-export function resolveAiEndpoints(
+export interface ResolvedEndpoint {
+  mode: ServiceMode
+  baseUrl: string
+  model: string
+  apiKey: string
+  authScheme: AuthScheme
+}
+
+export function resolveLlmEndpoint(
   settings: NectarSettings,
   localCortexUrl?: string | null,
-): {
-  baseUrl: string
-  llmModel: string
-  embeddingModel: string
-  apiKey: string
-} {
-  if (settings.mode === 'local') {
+): ResolvedEndpoint {
+  if (settings.llmMode === 'local') {
     const base = `${(localCortexUrl ?? `http://127.0.0.1:${settings.localPort}`).replace(/\/+$/, '')}/v1`
     return {
+      mode: 'local',
       baseUrl: base,
-      llmModel: settings.llmModel || 'gemma-4-E2B-it',
-      embeddingModel: settings.embeddingModel || 'embeddinggemma-300M',
+      model: settings.llmModel || 'gemma-4-E2B-it',
       apiKey: '',
+      authScheme: 'none',
     }
   }
+
+  const apiKey = settings.llmApiKey || ''
+  const authScheme: AuthScheme = settings.llmAuthScheme || 'Bearer'
 
   if (settings.cloudAiProvider === 'gemini') {
     return {
+      mode: 'cloud',
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-      llmModel: settings.cloudLlmModel || 'gemini-2.5-flash',
-      embeddingModel: settings.cloudEmbeddingModel || 'text-embedding-004',
-      apiKey: settings.cloudAiApiKey,
+      model: settings.llmModel || 'gemini-2.5-flash',
+      apiKey,
+      authScheme,
     }
   }
 
-  if (settings.cloudAiProvider === 'custom') {
+  if (settings.cloudAiProvider === 'openai') {
     return {
-      baseUrl: (settings.llmBaseUrl || 'https://api.openai.com/v1').replace(/\/+$/, ''),
-      llmModel: settings.llmModel || 'gpt-4o-mini',
-      embeddingModel: settings.embeddingModel || 'text-embedding-3-small',
-      apiKey: settings.llmApiKey || settings.cloudAiApiKey,
+      mode: 'cloud',
+      baseUrl: 'https://api.openai.com/v1',
+      model: settings.llmModel || 'gpt-4o-mini',
+      apiKey,
+      authScheme,
     }
   }
 
-  // Default: OpenAI
+  // OpenAI-compatible or custom
   return {
-    baseUrl: 'https://api.openai.com/v1',
-    llmModel: settings.cloudLlmModel || 'gpt-4o-mini',
-    embeddingModel: settings.cloudEmbeddingModel || 'text-embedding-3-small',
-    apiKey: settings.cloudAiApiKey,
+    mode: 'cloud',
+    baseUrl: (settings.llmBaseUrl || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+    model: settings.llmModel || 'gpt-4o-mini',
+    apiKey,
+    authScheme,
+  }
+}
+
+export function resolveEmbeddingEndpoint(
+  settings: NectarSettings,
+  localCortexUrl?: string | null,
+): ResolvedEndpoint {
+  if (settings.embeddingMode === 'local') {
+    const base = `${(localCortexUrl ?? `http://127.0.0.1:${settings.localPort}`).replace(/\/+$/, '')}/v1`
+    return {
+      mode: 'local',
+      baseUrl: base,
+      model: settings.embeddingModel || 'embeddinggemma-300M',
+      apiKey: '',
+      authScheme: 'none',
+    }
+  }
+
+  const apiKey = settings.embeddingApiKey || settings.llmApiKey || ''
+  const explicitBase = settings.embeddingBaseUrl?.trim()
+  if (explicitBase) {
+    return {
+      mode: 'cloud',
+      baseUrl: explicitBase.replace(/\/+$/, ''),
+      model: settings.embeddingModel || 'default',
+      apiKey,
+      authScheme: settings.embeddingAuthScheme || 'Api-Key',
+    }
+  }
+
+  // Fallback to LLM cloud base URL if no separate embedding URL was specified
+  const llm = resolveLlmEndpoint(settings, localCortexUrl)
+  return {
+    mode: 'cloud',
+    baseUrl: llm.baseUrl,
+    model:
+      settings.embeddingModel ||
+      (settings.cloudAiProvider === 'gemini'
+        ? 'text-embedding-004'
+        : 'text-embedding-3-small'),
+    apiKey,
+    authScheme: settings.embeddingAuthScheme || llm.authScheme,
   }
 }
 
@@ -80,31 +133,29 @@ export async function distillMeeting(
   settings: NectarSettings,
   localCortexUrl?: string | null,
 ): Promise<DistillResult> {
-  const { baseUrl, llmModel: model, apiKey } = resolveAiEndpoints(
-    settings,
-    localCortexUrl,
-  )
+  const llm = resolveLlmEndpoint(settings, localCortexUrl)
 
   const transcriptText = meeting.turns
     .map((t) => `[${formatTimecode(t.t0)}] ${t.speaker}: ${t.text}`)
     .join('\n')
 
-  if (settings.mode === 'local' || apiKey) {
+  if (llm.mode === 'local' || llm.apiKey || llm.authScheme === 'none') {
     try {
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 15_000)
+      const timer = setTimeout(() => controller.abort(), 25_000)
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
       }
-      if (apiKey) {
-        headers.Authorization = `Bearer ${apiKey}`
+      const auth = buildAuthHeader(llm.authScheme, llm.apiKey)
+      if (auth) {
+        headers.Authorization = auth
       }
 
-      const res = await fetch(`${baseUrl}/chat/completions`, {
+      const res = await fetch(`${llm.baseUrl}/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          model: model || 'default',
+          model: llm.model || 'default',
           temperature: 0.2,
           max_tokens: 900,
           response_format: { type: 'json_object' },
@@ -152,7 +203,7 @@ export async function distillMeeting(
                 ? (parsed.relationships as SemanticAssertions['relationships'])
                 : [],
             },
-            provider: `${settings.mode}:${model || 'llm'}`,
+            provider: `${llm.mode}:${llm.model || 'llm'}`,
           }
         }
       }

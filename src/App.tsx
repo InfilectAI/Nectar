@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import {
+  AlertCircle,
   Check,
-  Cloud,
   Copy,
-  Cpu,
+  Download,
+  Loader2,
   MessageSquareText,
   Play,
   Plus,
@@ -19,11 +20,23 @@ import {
   AgentIcon,
   type McpAgentId,
 } from './components/AgentIcons'
+import {
+  DownloadConfirmModal,
+  getMissingSelectedLocalModels,
+  getSelectedLocalModelIds,
+} from './components/DownloadConfirmModal'
 import { GranolaHandle } from './components/GranolaHandle'
+import { formatBytes } from './utils/format'
+import { OnboardingWizard } from './components/OnboardingWizard'
+import { ServiceStackEditor } from './components/ServiceStackEditor'
 import type {
   AppState,
+  CortexRuntimeStatus,
+  LocalModelId,
+  LocalModelInfo,
   MeetingRecord,
   NectarSettings,
+  StreamingWsStatus,
 } from './types'
 
 function SignalInflectionMark({ className = 'w-4 h-4' }: { className?: string }) {
@@ -66,8 +79,10 @@ export default function App() {
   const [noteTab, setNoteTab] = useState<'notes' | 'summary'>('notes')
   const [showTranscript, setShowTranscript] = useState(true)
   const [showSettingsModal, setShowSettingsModal] = useState(false)
-  const [settingsTab, setSettingsTab] = useState<'local' | 'cloud'>('local')
-  const [showCustomCloud, setShowCustomCloud] = useState(false)
+  const [showOnboarding, setShowOnboarding] = useState(false)
+  const [pendingSettingsDownloads, setPendingSettingsDownloads] = useState<
+    LocalModelInfo[] | null
+  >(null)
   const [showMcpModal, setShowMcpModal] = useState(false)
   const [selectedMcpAgent, setSelectedMcpAgent] = useState<McpAgentId>('claude')
   const [showManualMcp, setShowManualMcp] = useState(false)
@@ -90,6 +105,9 @@ export default function App() {
     window.nectar.getState().then((initial) => {
       setState(initial)
       setSettingsDraft(initial.settings)
+      if (!isPillOverlay && !initial.settings.onboardingCompleted) {
+        setShowOnboarding(true)
+      }
       if (initial.meetings.length > 0) {
         setSelectedMeetingId(initial.meetings[0]!.id)
       }
@@ -108,10 +126,22 @@ export default function App() {
       } else if (ev.type === 'meetings:detected') {
         const detectedMeetings = ev.detectedMeetings as AppState['detectedMeetings']
         setState((prev) => (prev ? { ...prev, detectedMeetings } : prev))
-      } else if (ev.type === 'primitives:changed') {
-        const cortexPrimitives = ev.cortexPrimitives as Record<string, string>
-        const cortexStatus = (ev.cortexStatus as AppState['cortexStatus']) ?? 'running'
-        setState((prev) => (prev ? { ...prev, cortexPrimitives, cortexStatus } : prev))
+      } else if (ev.type === 'models:changed') {
+        const cortexStatus = ev.cortexStatus as CortexRuntimeStatus
+        const cortexUrl = (ev.cortexUrl as string | null) ?? null
+        const cortexError = (ev.cortexError as string | null) ?? null
+        const localModels = (ev.localModels as LocalModelInfo[]) ?? []
+        setState((prev) =>
+          prev
+            ? {
+                ...prev,
+                cortexStatus,
+                cortexUrl,
+                cortexError,
+                localModels,
+              }
+            : prev,
+        )
       } else if (ev.type === 'permissions:changed') {
         const permissions = ev.permissions as Record<string, string>
         setState((prev) => (prev ? { ...prev, permissions } : prev))
@@ -125,11 +155,19 @@ export default function App() {
           )
           return { ...prev, meetings }
         })
+      } else if (ev.type === 'streaming:status') {
+        const streamingWs = ev.streamingWs as StreamingWsStatus
+        setState((prev) => (prev ? { ...prev, streamingWs } : prev))
       } else if (ev.type === 'meeting:partial') {
-        setLivePartial({
-          speaker: String(ev.speaker ?? 'Speaker'),
-          text: String(ev.text ?? ''),
-        })
+        const text = String(ev.text ?? '').trim()
+        if (!text) {
+          setLivePartial(null)
+        } else {
+          setLivePartial({
+            speaker: String(ev.speaker ?? 'Speaker'),
+            text,
+          })
+        }
       }
     })
 
@@ -267,6 +305,101 @@ export default function App() {
     2,
   )
 
+  const openServicesSettings = () => {
+    setSettingsDraft(state.settings)
+    setShowSettingsModal(true)
+    if (getSelectedLocalModelIds(state.settings).length > 0) {
+      window.nectar.refreshLocalModels().catch(() => {})
+    }
+  }
+
+  const handleRefreshModels = () => {
+    window.nectar.refreshLocalModels().then((res) => {
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              cortexStatus: res.cortexStatus,
+              cortexUrl: res.cortexUrl,
+              cortexError: res.cortexError,
+              localModels: res.localModels,
+            }
+          : prev,
+      )
+    })
+  }
+
+  const handleRestartCortex = () => {
+    window.nectar.restartCortex().then((next) => {
+      setState(next)
+      setSettingsDraft(next.settings)
+    })
+  }
+
+  const handleDownloadModel = (id: LocalModelId) => {
+    window.nectar.downloadLocalModel(id).catch(() => {})
+  }
+
+  const handleDownloadModels = (ids: LocalModelId[]) => {
+    window.nectar.downloadAllLocalModels(ids).catch(() => {})
+  }
+
+  const handleCancelDownload = (id: LocalModelId) => {
+    window.nectar.cancelLocalModelDownload(id).catch(() => {})
+  }
+
+  const handleOpenModelsFolder = () => {
+    window.nectar.openModelsFolder().catch(() => {})
+  }
+
+  const persistSettingsModal = async (downloadIds?: LocalModelId[]) => {
+    if (!settingsDraft) return
+    const next = await window.nectar.saveSettings(settingsDraft)
+    setState(next)
+    setSettingsDraft(next.settings)
+    if (downloadIds && downloadIds.length > 0) {
+      handleDownloadModels(downloadIds)
+    }
+    setPendingSettingsDownloads(null)
+    setShowSettingsModal(false)
+  }
+
+  const handleSaveSettingsModal = async () => {
+    if (!settingsDraft) return
+    const missing = getMissingSelectedLocalModels(settingsDraft, localModels)
+    if (missing.length > 0) {
+      setPendingSettingsDownloads(missing)
+      return
+    }
+    await persistSettingsModal()
+  }
+
+  const localModels = state.localModels ?? []
+  const selectedLocalIds = getSelectedLocalModelIds(state.settings)
+  const anyLocalSelected = selectedLocalIds.length > 0
+  const activeModels = localModels.filter(
+    (m) => m.status === 'downloading' || m.status === 'loading',
+  )
+  const primaryActiveModel =
+    activeModels.find((m) => m.status === 'downloading') ?? activeModels[0] ?? null
+  const missingSelectedLocalModels = getMissingSelectedLocalModels(
+    state.settings,
+    localModels,
+  )
+  const sttModel = localModels.find((m) => m.id === 'stt')
+  const diarizeModel = localModels.find((m) => m.id === 'diarize')
+  const streamingWs = state.streamingWs
+
+  const speakerColorClass = (speaker: string) => {
+    if (speaker.endsWith('_1') || speaker === 'Priya' || speaker === 'Daniel') {
+      return 'text-emerald-700'
+    }
+    if (speaker.endsWith('_2') || speaker === 'Alex') {
+      return 'text-amber'
+    }
+    return 'text-signal'
+  }
+
   return (
     <div className="flex h-screen w-screen flex-col bg-chassis text-ink font-sans select-text">
       {/* Minimal macOS Titlebar */}
@@ -278,7 +411,7 @@ export default function App() {
           </span>
         </div>
 
-        {/* Center Live Call / Permission / Model Loading Banner */}
+        {/* Center Live Call / Permission / Model Download & Streaming WS Banner */}
         <div className="app-no-drag flex items-center gap-2">
           {(state.permissions?.accessibility === 'denied' ||
             state.permissions?.microphone === 'denied') && (
@@ -300,13 +433,92 @@ export default function App() {
             </div>
           )}
 
-          {(state.cortexPrimitives?.stt === 'loading' ||
-            state.cortexPrimitives?.diarize === 'loading') && (
-            <div className="flex items-center gap-2 rounded-[4px] border border-rail bg-well px-2.5 py-0.5 font-mono text-[10.5px] text-amber">
-              <span className="h-1.5 w-1.5 rounded-full bg-amber animate-ping" />
-              <span>Loading speech models…</span>
-            </div>
+          {streamingWs && streamingWs.status !== 'idle' && (
+            <button
+              type="button"
+              onClick={openServicesSettings}
+              className={`flex items-center gap-1.5 rounded-[4px] border px-2.5 py-0.5 font-mono text-[10.5px] font-semibold ${
+                streamingWs.status === 'connected'
+                  ? 'border-emerald-700/35 bg-emerald-950/10 text-emerald-800'
+                  : streamingWs.status === 'connecting'
+                    ? 'border-amber/45 bg-amber-tint text-amber'
+                    : 'border-signal/45 bg-signal-tint text-signal'
+              }`}
+            >
+              {streamingWs.status === 'connecting' ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : streamingWs.status === 'error' ? (
+                <AlertCircle className="h-3 w-3" />
+              ) : (
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
+              )}
+              <span>
+                {streamingWs.status === 'connected'
+                  ? `Streaming WS${
+                      streamingWs.numSpeakers > 0
+                        ? ` · ${streamingWs.numSpeakers} ${
+                            streamingWs.numSpeakers === 1 ? 'speaker' : 'speakers'
+                          }`
+                        : ''
+                    }`
+                  : streamingWs.status === 'connecting'
+                    ? 'Connecting WS…'
+                    : 'WS Stream Error'}
+              </span>
+            </button>
           )}
+
+          {anyLocalSelected && primaryActiveModel ? (
+            <button
+              type="button"
+              onClick={openServicesSettings}
+              className={`flex items-center gap-2 rounded-[4px] border px-2.5 py-0.5 font-mono text-[10.5px] transition-colors ${
+                primaryActiveModel.status === 'downloading'
+                  ? 'border-signal/45 bg-signal-tint text-signal hover:border-signal'
+                  : 'border-amber/45 bg-amber-tint text-amber hover:border-amber'
+              }`}
+            >
+              <Loader2 className="h-3 w-3 animate-spin" />
+              <span>
+                {primaryActiveModel.status === 'downloading'
+                  ? `Downloading ${primaryActiveModel.name}${
+                      primaryActiveModel.progress !== null
+                        ? ` (${Math.round(primaryActiveModel.progress * 100)}%)`
+                        : ''
+                    }`
+                  : `Compiling ${primaryActiveModel.name}…`}
+                {activeModels.length > 1 ? ` +${activeModels.length - 1}` : ''}
+              </span>
+            </button>
+          ) : anyLocalSelected &&
+            (state.cortexStatus === 'error' || state.cortexStatus === 'stopped') ? (
+            <button
+              type="button"
+              onClick={openServicesSettings}
+              className="flex items-center gap-1.5 rounded-[4px] border border-signal/40 bg-signal-tint px-2.5 py-0.5 font-mono text-[10.5px] text-signal hover:border-signal"
+            >
+              <AlertCircle className="h-3 w-3" />
+              <span>
+                {state.cortexStatus === 'error'
+                  ? 'Local runtime error'
+                  : 'Local runtime offline'}
+              </span>
+            </button>
+          ) : anyLocalSelected &&
+            missingSelectedLocalModels.length > 0 &&
+            !state.activeCaptureMeetingId ? (
+            <button
+              type="button"
+              onClick={() => setPendingSettingsDownloads(missingSelectedLocalModels)}
+              className="flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-2.5 py-0.5 font-mono text-[10.5px] text-ink hover:border-ink/50"
+            >
+              <Download className="h-3 w-3 text-signal" />
+              <span>
+                Download {missingSelectedLocalModels.length} local{' '}
+                {missingSelectedLocalModels.length === 1 ? 'model' : 'models'}
+              </span>
+            </button>
+          ) : null}
 
           {state.activeCaptureMeetingId ? (
             <div className="flex items-center gap-2.5 rounded-[4px] border border-signal bg-signal-tint px-3 py-1">
@@ -350,11 +562,8 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => {
-              setSettingsTab(state.settings.mode === 'cloud' ? 'cloud' : 'local')
-              setShowSettingsModal(true)
-            }}
-            title="Settings"
+            onClick={openServicesSettings}
+            title="Models & Services Settings"
             className="inline-flex items-center gap-1.5 rounded-[4px] border border-rail bg-well px-2.5 py-1 font-mono text-[10.5px] text-ink hover:border-ink/40"
           >
             <SettingsIcon className="h-3.5 w-3.5 text-muted" />
@@ -654,7 +863,9 @@ export default function App() {
                         className="rounded-[4px] border border-rail bg-well p-3"
                       >
                         <div className="flex items-center justify-between font-mono text-[10.5px]">
-                          <span className="font-semibold text-signal">
+                          <span
+                            className={`font-semibold ${speakerColorClass(turn.speaker)}`}
+                          >
                             {turn.speaker}
                           </span>
                           <span className="text-dim">{formatTimecode(turn.t0)}</span>
@@ -668,7 +879,9 @@ export default function App() {
                     {livePartial && (
                       <div className="rounded-[4px] border border-dashed border-signal bg-signal-tint p-3">
                         <div className="flex items-center justify-between font-mono text-[10.5px]">
-                          <span className="font-semibold text-signal">
+                          <span
+                            className={`font-semibold ${speakerColorClass(livePartial.speaker)}`}
+                          >
                             {livePartial.speaker}
                           </span>
                           <span className="text-signal">Live…</span>
@@ -680,22 +893,126 @@ export default function App() {
                     )}
 
                     {selectedMeeting.turns.length === 0 && !livePartial && (
-                      <div className="p-6 text-center text-[12.5px] text-muted space-y-2">
-                        {state.cortexPrimitives?.stt === 'loading' ||
-                        state.cortexPrimitives?.diarize === 'loading' ? (
+                      <div className="p-6 text-center text-[12.5px] text-muted space-y-2.5">
+                        {state.settings.sttMode === 'local' &&
+                        (sttModel?.status === 'downloading' ||
+                          diarizeModel?.status === 'downloading') ? (
+                          <div className="rounded-[4px] border border-signal/40 bg-signal-tint p-3 font-mono text-[11px] text-ink space-y-1.5 text-left">
+                            <div className="flex items-center gap-1.5 font-semibold text-signal">
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              <span>
+                                Downloading{' '}
+                                {sttModel?.status === 'downloading'
+                                  ? sttModel.name
+                                  : diarizeModel?.name}
+                                …
+                              </span>
+                            </div>
+                            <div className="text-[10.5px] text-muted">
+                              {(sttModel?.status === 'downloading'
+                                ? sttModel.detail
+                                : diarizeModel?.detail) ??
+                                'First-time Core ML download from HuggingFace…'}
+                            </div>
+                            {(() => {
+                              const active =
+                                sttModel?.status === 'downloading'
+                                  ? sttModel
+                                  : diarizeModel
+                              if (!active || active.progress === null) return null
+                              return (
+                                <div className="space-y-1 pt-1">
+                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-well">
+                                    <div
+                                      className="h-full rounded-full bg-signal transition-all duration-200"
+                                      style={{
+                                        width: `${Math.max(
+                                          3,
+                                          Math.round(active.progress * 100),
+                                        )}%`,
+                                      }}
+                                    />
+                                  </div>
+                                  <div className="text-[10px] text-dim tabular-nums">
+                                    {Math.round(active.progress * 100)}% ·{' '}
+                                    {formatBytes(active.downloadedBytes)} /{' '}
+                                    {formatBytes(active.totalBytes)}
+                                  </div>
+                                </div>
+                              )
+                            })()}
+                          </div>
+                        ) : state.settings.sttMode === 'local' &&
+                          (sttModel?.status === 'loading' ||
+                            diarizeModel?.status === 'loading') ? (
                           <div className="rounded-[4px] border border-amber bg-amber-tint p-3 font-mono text-[11px] text-ink">
-                            Loading local WhisperKit &amp; SpeakerKit models into Apple
+                            Compiling local WhisperKit &amp; SpeakerKit models for Apple
                             Neural Engine… (first run takes ~20s)
                           </div>
+                        ) : state.settings.sttMode === 'local' &&
+                          (sttModel?.status === 'error' ||
+                            diarizeModel?.status === 'error') ? (
+                          <div className="rounded-[4px] border border-signal/40 bg-signal-tint p-3 font-mono text-[11px] text-signal space-y-2">
+                            <div>
+                              Local speech model error:{' '}
+                              {sttModel?.error ?? diarizeModel?.error}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={openServicesSettings}
+                              className="rounded-[3px] bg-ink px-2.5 py-1 text-[10.5px] font-semibold text-well"
+                            >
+                              Inspect Services
+                            </button>
+                          </div>
+                        ) : streamingWs?.status === 'error' && streamingWs.error ? (
+                          <div className="rounded-[4px] border border-signal/40 bg-signal-tint p-3 font-mono text-[11px] text-signal space-y-2">
+                            <div>Stream error: {streamingWs.error}</div>
+                            <button
+                              type="button"
+                              onClick={openServicesSettings}
+                              className="rounded-[3px] bg-ink px-2.5 py-1 text-[10.5px] font-semibold text-well"
+                            >
+                              Check STT Settings
+                            </button>
+                          </div>
                         ) : isRecordingThisMeeting ? (
-                          <div className="font-mono text-[11.5px] text-signal">
-                            Listening for speech…
+                          <div className="space-y-2">
+                            <div className="font-mono text-[11.5px] text-signal">
+                              {streamingWs?.status === 'connecting'
+                                ? 'Connecting to streaming WebSocket…'
+                                : 'Listening for speech…'}
+                            </div>
+                            {state.settings.sttMode === 'local' &&
+                              sttModel?.status === 'not_downloaded' && (
+                                <div className="font-mono text-[10.5px] text-muted">
+                                  First speech segment will download WhisperKit (~950 MB)
+                                  automatically.
+                                </div>
+                              )}
                           </div>
                         ) : (
                           <div>Transcript segments appear here during a meeting.</div>
                         )}
                       </div>
                     )}
+                  </div>
+
+                  <div className="flex items-center justify-between border-t border-rail bg-strip px-3.5 py-2 font-mono text-[10px] text-muted">
+                    <span>
+                      {state.settings.sttMode === 'local'
+                        ? 'Local Speech'
+                        : state.settings.cloudSttProvider === 'websocket'
+                          ? `Streaming WS${
+                              streamingWs?.lastLatencyMs
+                                ? ` · ${(streamingWs.lastLatencyMs / 1000).toFixed(2)}s`
+                                : ''
+                            }`
+                          : `Cloud STT (${state.settings.cloudSttProvider})`}
+                    </span>
+                    <span>
+                      {state.settings.llmMode === 'local' ? 'Local LLM' : 'Cloud LLM'}
+                    </span>
                   </div>
                 </div>
               )}
@@ -708,559 +1025,167 @@ export default function App() {
         </main>
       </div>
 
-      {/* Settings Modal with Local / Cloud Tabs */}
+      {/* Unified Models & Services Settings Modal (Per-Service Mix & Match) */}
       {showSettingsModal && settingsDraft && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 backdrop-blur-[1px] p-4">
-          <div className="w-full max-w-lg rounded-[4px] border border-rail bg-well shadow-xl overflow-hidden">
-            {/* Modal Header with Local / Cloud Tabs */}
-            <div className="flex items-center justify-between border-b border-rail bg-strip px-4 py-2.5">
-              <div className="inline-flex rounded-[4px] border border-rail bg-chassis p-0.5 font-mono text-[11px]">
-                <button
-                  onClick={() => {
-                    setSettingsTab('local')
-                    setSettingsDraft({ ...settingsDraft, mode: 'local' })
-                  }}
-                  className={`inline-flex items-center gap-1.5 rounded-[3px] px-3 py-1 transition-colors ${
-                    settingsTab === 'local'
-                      ? 'bg-ink text-well font-semibold'
-                      : 'text-muted hover:text-ink'
-                  }`}
-                >
-                  <Cpu className="h-3 w-3" />
-                  Local
-                </button>
-                <button
-                  onClick={() => {
-                    setSettingsTab('cloud')
-                    setSettingsDraft({ ...settingsDraft, mode: 'cloud' })
-                  }}
-                  className={`inline-flex items-center gap-1.5 rounded-[3px] px-3 py-1 transition-colors ${
-                    settingsTab === 'cloud'
-                      ? 'bg-signal text-white font-semibold'
-                      : 'text-muted hover:text-ink'
-                  }`}
-                >
-                  <Cloud className="h-3 w-3" />
-                  Cloud
-                </button>
+          <div className="w-full max-w-2xl rounded-[6px] border border-rail bg-well shadow-xl overflow-hidden flex flex-col">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-rail bg-strip px-4.5 py-3">
+              <div className="flex items-center gap-2.5">
+                <span className="text-[14px] font-semibold tracking-[-0.015em] text-ink">
+                  Models &amp; Services
+                </span>
+                <span className="font-mono text-[10px] text-muted">
+                  Mix Local &amp; Cloud per service
+                </span>
               </div>
 
-              <button
-                onClick={() => setShowSettingsModal(false)}
-                className="text-muted hover:text-ink"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowSettingsModal(false)
+                    setShowOnboarding(true)
+                  }}
+                  className="rounded-[3px] border border-rail bg-well px-2 py-0.5 font-mono text-[10px] font-medium text-ink hover:border-ink/50"
+                >
+                  Setup Wizard
+                </button>
+                <button
+                  onClick={() => setShowSettingsModal(false)}
+                  className="text-muted hover:text-ink"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
-            <div className="p-5 space-y-4 max-h-[82vh] overflow-y-auto">
-              {/* TAB 1: LOCAL ON-DEVICE */}
-              {settingsTab === 'local' && (
-                <div className="space-y-4">
-                  <div className="rounded-[4px] border border-rail bg-recessed p-4 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-[11px] font-semibold text-ink uppercase">
-                        On-Device Runtime
-                      </span>
-                      <span className="rounded-[3px] bg-emerald-950 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
-                        100% LOCAL
-                      </span>
-                    </div>
-                    <p className="text-[12.5px] text-muted leading-relaxed">
-                      Runs transcription, speaker diarization, note enhancement, and memory
-                      embeddings locally on your Mac.
-                    </p>
+            <div className="p-5 space-y-4 max-h-[78vh] overflow-y-auto">
+              <ServiceStackEditor
+                draft={settingsDraft}
+                onChange={setSettingsDraft}
+                cortexStatus={state.cortexStatus}
+                cortexError={state.cortexError}
+                localModels={localModels}
+                onRefreshModels={handleRefreshModels}
+                onRestartCortex={handleRestartCortex}
+                onDownloadModel={handleDownloadModel}
+                onCancelDownload={handleCancelDownload}
+                onOpenModelsFolder={handleOpenModelsFolder}
+              />
 
-                    <div className="grid grid-cols-4 gap-2 pt-1 font-mono text-[10.5px]">
-                      {(['stt', 'diarize', 'chat', 'embed'] as const).map((prim) => (
-                        <div
-                          key={prim}
-                          className="rounded-[3px] border border-rail bg-well p-2 text-center"
-                        >
-                          <div className="text-[9.5px] text-muted uppercase">{prim}</div>
-                          <div className="font-semibold text-ink mt-0.5">
-                            {state.cortexPrimitives?.[prim] ?? 'ready'}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="pt-2">
-                      <label className="block font-mono text-[10.5px] text-muted mb-1">
-                        Local Server Port
-                      </label>
-                      <input
-                        type="number"
-                        value={settingsDraft.localPort}
-                        onChange={(e) =>
-                          setSettingsDraft({
-                            ...settingsDraft,
-                            localPort: Number(e.target.value),
-                          })
-                        }
-                        className="w-36 rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[12px]"
-                      />
-                    </div>
+              {/* Local Server Port (only when >=1 service uses Local) */}
+              {getSelectedLocalModelIds(settingsDraft).length > 0 && (
+                <div className="flex items-end justify-between gap-3 rounded-[4px] border border-rail bg-chassis px-3.5 py-2.5">
+                  <div>
+                    <label className="block font-mono text-[10px] text-muted mb-1">
+                      Local Runtime Port
+                    </label>
+                    <input
+                      type="number"
+                      value={settingsDraft.localPort}
+                      onChange={(e) =>
+                        setSettingsDraft({
+                          ...settingsDraft,
+                          localPort: Number(e.target.value),
+                        })
+                      }
+                      className="w-32 rounded-[4px] border border-rail bg-well px-2.5 py-1 font-mono text-[11.5px]"
+                    />
                   </div>
-
-                  {/* macOS Permissions row */}
-                  <div className="flex items-center justify-between rounded-[4px] border border-rail bg-chassis px-3.5 py-2.5 font-mono text-[11px]">
-                    <div className="flex items-center gap-3">
-                      <span>
-                        Accessibility:{' '}
-                        <strong
-                          className={
-                            state.permissions?.accessibility === 'granted'
-                              ? 'text-emerald-700'
-                              : 'text-signal'
-                          }
-                        >
-                          {state.permissions?.accessibility ?? 'granted'}
-                        </strong>
-                      </span>
-                      <span>·</span>
-                      <span>
-                        Mic:{' '}
-                        <strong
-                          className={
-                            state.permissions?.microphone === 'granted'
-                              ? 'text-emerald-700'
-                              : 'text-signal'
-                          }
-                        >
-                          {state.permissions?.microphone ?? 'granted'}
-                        </strong>
-                      </span>
-                    </div>
-                    <button
-                      onClick={async () => {
-                        const perms = await window.nectar.checkPermissions(true)
-                        setState((prev) => (prev ? { ...prev, permissions: perms } : prev))
-                      }}
-                      className="rounded-[3px] border border-rail bg-well px-2.5 py-1 text-[10.5px] font-semibold text-ink hover:border-ink/40"
-                    >
-                      Check Permissions
-                    </button>
-                  </div>
+                  <span className="font-mono text-[10px] text-dim">
+                    {state.cortexUrl ?? `http://127.0.0.1:${settingsDraft.localPort}`}
+                  </span>
                 </div>
               )}
 
-              {/* TAB 2: CLOUD PROVIDERS */}
-              {settingsTab === 'cloud' && (
-                <div className="space-y-3.5">
-                  {/* 1. Transcription & Diarization */}
-                  <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-[11px] font-semibold text-ink uppercase">
-                        Transcription &amp; Diarization
-                      </span>
-                      <span className="font-mono text-[10px] text-muted">
-                        Diarization included
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2.5">
-                      <div>
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          Provider
-                        </label>
-                        <select
-                          value={settingsDraft.cloudSttProvider}
-                          onChange={(e) => {
-                            const p = e.target.value as NectarSettings['cloudSttProvider']
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudSttProvider: p,
-                            })
-                            if (p === 'custom') setShowCustomCloud(true)
-                          }}
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        >
-                          <option value="deepgram">Deepgram</option>
-                          <option value="assemblyai">AssemblyAI</option>
-                          <option value="openai">OpenAI</option>
-                          <option value="gemini">Google Gemini</option>
-                          <option value="custom">Custom API</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          Model Name (optional)
-                        </label>
-                        <input
-                          type="text"
-                          value={settingsDraft.cloudSttModel}
-                          onChange={(e) =>
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudSttModel: e.target.value,
-                            })
-                          }
-                          placeholder="e.g. nova-3, universal-2, whisper-1"
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        />
-                      </div>
-
-                      <div className="col-span-2">
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          API Key
-                        </label>
-                        <input
-                          type="password"
-                          value={settingsDraft.cloudSttApiKey}
-                          onChange={(e) =>
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudSttApiKey: e.target.value,
-                            })
-                          }
-                          placeholder="Enter provider API key…"
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* 2. LLM & Embeddings */}
-                  <div className="rounded-[4px] border border-rail bg-recessed p-3.5 space-y-2.5">
-                    <div className="font-mono text-[11px] font-semibold text-ink uppercase">
-                      LLM &amp; Embeddings
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2.5">
-                      <div>
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          Provider
-                        </label>
-                        <select
-                          value={settingsDraft.cloudAiProvider}
-                          onChange={(e) => {
-                            const p = e.target.value as NectarSettings['cloudAiProvider']
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudAiProvider: p,
-                            })
-                            if (p === 'custom') setShowCustomCloud(true)
-                          }}
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        >
-                          <option value="openai">OpenAI</option>
-                          <option value="gemini">Google Gemini</option>
-                          <option value="custom">Custom API</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          LLM Model
-                        </label>
-                        <input
-                          type="text"
-                          value={settingsDraft.cloudLlmModel}
-                          onChange={(e) =>
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudLlmModel: e.target.value,
-                            })
-                          }
-                          placeholder="Model ID…"
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          Embedding Model
-                        </label>
-                        <input
-                          type="text"
-                          value={settingsDraft.cloudEmbeddingModel}
-                          onChange={(e) =>
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudEmbeddingModel: e.target.value,
-                            })
-                          }
-                          placeholder="Model ID…"
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        />
-                      </div>
-
-                      <div className="col-span-3">
-                        <label className="block font-mono text-[10px] text-muted mb-1">
-                          API Key
-                        </label>
-                        <input
-                          type="password"
-                          value={settingsDraft.cloudAiApiKey}
-                          onChange={(e) =>
-                            setSettingsDraft({
-                              ...settingsDraft,
-                              cloudAiApiKey: e.target.value,
-                            })
-                          }
-                          placeholder="Enter provider API key…"
-                          className="w-full rounded-[4px] border border-rail bg-well px-2.5 py-1.5 font-mono text-[11.5px]"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Collapsible Custom Endpoints Per Model */}
-                  <div className="rounded-[4px] border border-rail bg-chassis">
-                    <button
-                      type="button"
-                      onClick={() => setShowCustomCloud(!showCustomCloud)}
-                      className="flex w-full items-center justify-between px-3.5 py-2 font-mono text-[10.5px] font-semibold text-muted hover:text-ink"
+              {/* macOS Permissions row */}
+              <div className="flex items-center justify-between rounded-[4px] border border-rail bg-chassis px-3.5 py-2.5 font-mono text-[11px]">
+                <div className="flex items-center gap-3">
+                  <span>
+                    Accessibility:{' '}
+                    <strong
+                      className={
+                        state.permissions?.accessibility === 'granted'
+                          ? 'text-emerald-700'
+                          : 'text-signal'
+                      }
                     >
-                      <span>Custom Endpoints (URL, Model &amp; Key per Primitive)</span>
-                      <span>{showCustomCloud ? '−' : '+'}</span>
-                    </button>
-
-                    {showCustomCloud && (
-                      <div className="border-t border-rail p-3.5 space-y-2.5 bg-recessed">
-                        <div className="grid grid-cols-3 gap-2">
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              STT URL
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.sttUrl}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  sttUrl: e.target.value,
-                                })
-                              }
-                              placeholder="https://.../v1/audio/transcriptions"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              STT Model
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.sttModel}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  sttModel: e.target.value,
-                                })
-                              }
-                              placeholder="Model name…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              STT Key
-                            </label>
-                            <input
-                              type="password"
-                              value={settingsDraft.sttApiKey}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  sttApiKey: e.target.value,
-                                })
-                              }
-                              placeholder="API Key…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              Diarize URL (optional)
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.diarizeUrl}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  diarizeUrl: e.target.value,
-                                })
-                              }
-                              placeholder="https://.../v1/audio/diarize"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              Diarize Model
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.diarizeModel}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  diarizeModel: e.target.value,
-                                })
-                              }
-                              placeholder="Model name…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              Diarize Key
-                            </label>
-                            <input
-                              type="password"
-                              value={settingsDraft.diarizeApiKey}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  diarizeApiKey: e.target.value,
-                                })
-                              }
-                              placeholder="API Key…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              LLM Base URL
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.llmBaseUrl}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  llmBaseUrl: e.target.value,
-                                })
-                              }
-                              placeholder="https://.../v1"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              LLM Model
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.llmModel}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  llmModel: e.target.value,
-                                })
-                              }
-                              placeholder="Model name…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              LLM Key
-                            </label>
-                            <input
-                              type="password"
-                              value={settingsDraft.llmApiKey}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  llmApiKey: e.target.value,
-                                })
-                              }
-                              placeholder="API Key…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              Embedding Base URL
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.embeddingBaseUrl}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  embeddingBaseUrl: e.target.value,
-                                })
-                              }
-                              placeholder="https://.../v1"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              Embedding Model
-                            </label>
-                            <input
-                              type="text"
-                              value={settingsDraft.embeddingModel}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  embeddingModel: e.target.value,
-                                })
-                              }
-                              placeholder="Model name…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                          <div>
-                            <label className="block font-mono text-[9.5px] text-muted mb-0.5">
-                              Embedding Key
-                            </label>
-                            <input
-                              type="password"
-                              value={settingsDraft.embeddingApiKey}
-                              onChange={(e) =>
-                                setSettingsDraft({
-                                  ...settingsDraft,
-                                  embeddingApiKey: e.target.value,
-                                })
-                              }
-                              placeholder="API Key…"
-                              className="w-full rounded-[3px] border border-rail bg-well px-2 py-1 font-mono text-[11px]"
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
+                      {state.permissions?.accessibility ?? 'granted'}
+                    </strong>
+                  </span>
+                  <span>·</span>
+                  <span>
+                    Mic:{' '}
+                    <strong
+                      className={
+                        state.permissions?.microphone === 'granted'
+                          ? 'text-emerald-700'
+                          : 'text-signal'
+                      }
+                    >
+                      {state.permissions?.microphone ?? 'granted'}
+                    </strong>
+                  </span>
                 </div>
-              )}
+                <button
+                  onClick={async () => {
+                    const perms = await window.nectar.checkPermissions(true)
+                    setState((prev) => (prev ? { ...prev, permissions: perms } : prev))
+                  }}
+                  className="rounded-[3px] border border-rail bg-well px-2.5 py-1 text-[10.5px] font-semibold text-ink hover:border-ink/40"
+                >
+                  Check Permissions
+                </button>
+              </div>
+            </div>
 
-              <div className="flex items-center justify-between pt-2 border-t border-rail">
-                <span className="font-mono text-[10.5px] text-muted">
-                  Mode: <strong className="uppercase text-ink">{settingsDraft.mode}</strong>
-                </span>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setShowSettingsModal(false)}
-                    className="rounded-[4px] border border-rail bg-well px-3.5 py-1.5 font-mono text-[11.5px] text-muted hover:text-ink"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={async () => {
-                      const next = await window.nectar.saveSettings(settingsDraft)
-                      setState(next)
-                      setShowSettingsModal(false)
-                    }}
-                    className="rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright"
-                  >
-                    Save
-                  </button>
-                </div>
+            <div className="flex items-center justify-between border-t border-rail bg-strip px-5 py-3">
+              <span className="font-mono text-[10.5px] text-muted">
+                Stack:{' '}
+                <strong className="uppercase text-ink">
+                  {getSelectedLocalModelIds(settingsDraft).length} Local ·{' '}
+                  {4 - getSelectedLocalModelIds(settingsDraft).length} Cloud
+                </strong>
+                {settingsDraft.sttMode === 'cloud' &&
+                  settingsDraft.sttIncludesDiarization && (
+                    <span className="text-dim"> · STT+Diarize combined</span>
+                  )}
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowSettingsModal(false)}
+                  className="rounded-[4px] border border-rail bg-well px-3.5 py-1.5 font-mono text-[11.5px] text-muted hover:text-ink"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSaveSettingsModal}
+                  className="rounded-[4px] bg-ink px-4 py-1.5 font-mono text-[11.5px] font-semibold text-well hover:bg-signal-bright"
+                >
+                  Save
+                </button>
               </div>
             </div>
           </div>
         </div>
+      )}
+
+      {/* Download Confirmation Popup when saving Settings or clicking Titlebar download pill */}
+      {pendingSettingsDownloads && (
+        <DownloadConfirmModal
+          models={pendingSettingsDownloads}
+          confirmLabel={showSettingsModal ? 'Download & Save' : 'Start Download'}
+          onCancel={() => setPendingSettingsDownloads(null)}
+          onConfirm={() => {
+            if (showSettingsModal) {
+              persistSettingsModal(pendingSettingsDownloads.map((m) => m.id))
+            } else {
+              handleDownloadModels(pendingSettingsDownloads.map((m) => m.id))
+              setPendingSettingsDownloads(null)
+            }
+          }}
+        />
       )}
 
       {/* Paper-Style "Connect your agent" MCP Modal */}
@@ -1539,6 +1464,33 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+      {/* First-Run Onboarding Wizard */}
+      {showOnboarding && (
+        <OnboardingWizard
+          state={state}
+          onSaveSettings={async (patch) => {
+            const next = await window.nectar.saveSettings(patch)
+            setState(next)
+            setSettingsDraft(next.settings)
+          }}
+          onComplete={async () => {
+            const next = await window.nectar.completeOnboarding()
+            setState(next)
+            setSettingsDraft(next.settings)
+            setShowOnboarding(false)
+          }}
+          onCheckPermissions={async (prompt) => {
+            const perms = await window.nectar.checkPermissions(prompt)
+            setState((prev) => (prev ? { ...prev, permissions: perms } : prev))
+          }}
+          onRefreshModels={handleRefreshModels}
+          onRestartCortex={handleRestartCortex}
+          onDownloadModel={handleDownloadModel}
+          onDownloadModels={handleDownloadModels}
+          onCancelDownload={handleCancelDownload}
+          onOpenModelsFolder={handleOpenModelsFolder}
+        />
       )}
     </div>
   )
