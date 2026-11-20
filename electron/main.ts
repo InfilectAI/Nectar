@@ -8,9 +8,38 @@ import { Aira, type EyesSession, type MeetingTarget, type MeetingWatcher, type S
 import { Cortex, type CortexServer } from '@infilectai/cortex'
 import { SourceEvent, SourceType, Synapse } from '@infilectai/synapse'
 
-import { distillMeeting, resolveAiEndpoints } from './distiller.js'
+import {
+  deterministicDistill,
+  distillMeeting,
+  resolveEmbeddingEndpoint,
+  resolveLlmEndpoint,
+} from './distiller.js'
+import {
+  cancelCortexModelDownload,
+  fallbackLocalModels,
+  fetchCortexModels,
+  getModelsDir,
+  startCortexModelDownload,
+  type CortexRuntimeStatus,
+  type LocalModelId,
+  type LocalModelInfo,
+} from './local-models.js'
 import { MCP_TOOLS, McpHttpServer } from './mcp-server.js'
-import { NectarStore, getNectarDataDir, type MeetingRecord, type NectarSettings } from './store.js'
+import {
+  NectarStore,
+  anyServiceUsesLocal,
+  getEffectiveServiceModes,
+  getNectarDataDir,
+  type AuthScheme,
+  type MeetingRecord,
+  type NectarSettings,
+} from './store.js'
+import {
+  StreamingWsSession,
+  buildAuthHeader,
+  testStreamingWsConnection,
+  type StreamingWsStatus,
+} from './streaming-ws.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -22,12 +51,22 @@ let synapse: Synapse
 let aira: Aira | null = null
 let cortexServer: CortexServer | null = null
 let cortexUrl: string | null = null
-let cortexStatus: 'running' | 'starting' | 'stopped' | 'cloud' = 'stopped'
+let cortexStatus: CortexRuntimeStatus = 'stopped'
+let cortexError: string | null = null
 let cortexPrimitives: Record<string, string> = {}
+let localModelsSnapshot: LocalModelInfo[] = fallbackLocalModels('stopped')
 let healthPollTimer: NodeJS.Timeout | null = null
+let lastModelsDigest = ''
 let watcher: MeetingWatcher | null = null
 let detectedMeetings: MeetingTarget[] = []
 let activeCaptureSession: EyesSession | null = null
+let activeStreamingWs: StreamingWsSession | null = null
+let streamingWsStatus: StreamingWsStatus = {
+  status: 'idle',
+  numSpeakers: 0,
+  lastLatencyMs: null,
+  error: null,
+}
 let activeCaptureMeetingId: string | null = null
 let capturePaused = false
 let pillDragOffset: { x: number; y: number } | null = null
@@ -58,22 +97,76 @@ function broadcast(type: string, data: unknown = {}): void {
   }
 }
 
+function getLocalModelsPayload() {
+  return {
+    cortexStatus,
+    cortexUrl,
+    cortexError,
+    localModels: localModelsSnapshot,
+  }
+}
+
+function broadcastLocalModels(force = false): void {
+  const payload = getLocalModelsPayload()
+  const digest = JSON.stringify(payload)
+  if (!force && digest === lastModelsDigest) return
+  lastModelsDigest = digest
+  broadcast('models:changed', payload)
+}
+
+function stopHealthPolling(): void {
+  if (healthPollTimer) {
+    clearInterval(healthPollTimer)
+    healthPollTimer = null
+  }
+}
+
+function startHealthPolling(port: number): void {
+  stopHealthPolling()
+  healthPollTimer = setInterval(() => {
+    pollCortexHealth(port).catch(() => {})
+  }, 1000)
+}
+
 async function pollCortexHealth(port: number): Promise<void> {
+  if (store && !anyServiceUsesLocal(store.getSettings())) return
+  const baseUrl = `http://127.0.0.1:${port}`
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`)
-    if (!res.ok) return
-    const data = (await res.json()) as {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 2000)
+    const [healthRes, models] = await Promise.all([
+      fetch(`${baseUrl}/health`, { signal: controller.signal }),
+      fetchCortexModels(baseUrl, controller.signal).catch(() => null),
+    ])
+    clearTimeout(timer)
+    if (!healthRes.ok) {
+      if (cortexStatus === 'running') {
+        cortexStatus = 'stopped'
+        cortexPrimitives = {}
+        localModelsSnapshot = fallbackLocalModels('stopped')
+        broadcastLocalModels()
+      }
+      return
+    }
+    const data = (await healthRes.json()) as {
       status?: string
       primitives?: Record<string, string>
     }
-    const nextPrims = data.primitives ?? {}
-    if (JSON.stringify(nextPrims) !== JSON.stringify(cortexPrimitives)) {
-      cortexPrimitives = nextPrims
-      cortexStatus = 'running'
-      broadcast('primitives:changed', { cortexPrimitives, cortexStatus })
-    }
+    cortexPrimitives = data.primitives ?? {}
+    cortexUrl = baseUrl
+    cortexStatus = 'running'
+    cortexError = null
+    localModelsSnapshot = models ?? fallbackLocalModels('running', cortexPrimitives)
+    broadcastLocalModels()
   } catch {
-    // ignore transient poll error
+    if (cortexStatus !== 'starting') {
+      if (cortexStatus !== 'error') {
+        cortexStatus = 'stopped'
+      }
+      cortexPrimitives = {}
+      localModelsSnapshot = fallbackLocalModels(cortexStatus)
+      broadcastLocalModels()
+    }
   }
 }
 
@@ -106,11 +199,50 @@ function deterministicEmbed(text: string, dims: number = 64): number[] {
   return vec.map((v) => v / norm)
 }
 
+function projectVector(vec: number[], targetDims: number = 64): number[] {
+  if (vec.length === targetDims) return vec
+  const out = new Array<number>(targetDims).fill(0)
+  for (let i = 0; i < vec.length; i += 1) {
+    out[i % targetDims]! += vec[i]!
+  }
+  const norm = Math.sqrt(out.reduce((s, v) => s + v * v, 0)) || 1
+  return out.map((v) => v / norm)
+}
+
+function resolveDiarizeProvider(
+  settings: NectarSettings,
+): { url: string; apiKey?: string; headers?: Record<string, string> } | undefined {
+  const modes = getEffectiveServiceModes(settings)
+  if (modes.stt === 'cloud' && settings.sttIncludesDiarization) {
+    return undefined
+  }
+  if (modes.diarize === 'local') {
+    const base = (
+      cortexUrl ?? `http://127.0.0.1:${settings.localPort}`
+    ).replace(/\/+$/, '')
+    return {
+      url: `${base}/v1/audio/diarize`,
+    }
+  }
+  const url = settings.diarizeUrl?.trim()
+  if (!url) return undefined
+  const key = settings.diarizeApiKey || settings.sttApiKey
+  const auth = buildAuthHeader(settings.diarizeAuthScheme ?? 'Api-Key', key)
+  return {
+    url,
+    headers: auth ? { Authorization: auth } : undefined,
+  }
+}
+
 function resolveSttAndDiarize(settings: NectarSettings): {
   stt: STTProviderInput
-  diarize?: { url: string; apiKey?: string }
+  diarize?: { url: string; apiKey?: string; headers?: Record<string, string> }
+  useStreamingWs: boolean
 } {
-  if (settings.mode === 'local') {
+  const modes = getEffectiveServiceModes(settings)
+  const diarize = resolveDiarizeProvider(settings)
+
+  if (modes.stt === 'local') {
     const base = (
       cortexUrl ?? `http://127.0.0.1:${settings.localPort}`
     ).replace(/\/+$/, '')
@@ -119,19 +251,26 @@ function resolveSttAndDiarize(settings: NectarSettings): {
         url: `${base}/v1/audio/transcriptions`,
         model: settings.sttModel || 'whisper-large-v3',
       },
-      diarize: {
-        url: `${base}/v1/audio/diarize`,
-      },
+      diarize,
+      useStreamingWs: false,
     }
   }
 
-  const provider = settings.cloudSttProvider || 'deepgram'
-  const apiKey = settings.cloudSttApiKey || settings.cloudAiApiKey
+  const provider = settings.cloudSttProvider || 'websocket'
+  const apiKey = settings.sttApiKey
+
+  if (provider === 'websocket') {
+    return {
+      // Audio PCM is streamed directly over StreamingWsSession; no-op batch callback prevents double STT
+      stt: async () => ({ text: '' }),
+      diarize: undefined,
+      useStreamingWs: true,
+    }
+  }
 
   if (provider === 'deepgram') {
-    const model = settings.cloudSttModel || 'nova-3'
+    const model = settings.sttModel || 'nova-3'
     return {
-      // Deepgram bundles transcription + speaker diarization in one call (`diarize=true`)
       stt: async (wav: Buffer) => {
         const res = await fetch(
           `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&smart_format=true&diarize=true`,
@@ -152,26 +291,20 @@ function resolveSttAndDiarize(settings: NectarSettings): {
             channels?: Array<{
               alternatives?: Array<{
                 transcript?: string
-                words?: Array<{
-                  word: string
-                  start: number
-                  end: number
-                  speaker?: number
-                }>
               }>
             }>
           }
         }
         const alt = data.results?.channels?.[0]?.alternatives?.[0]
-        const text = alt?.transcript ?? ''
-        return { text }
+        return { text: alt?.transcript ?? '' }
       },
+      diarize,
+      useStreamingWs: false,
     }
   }
 
   if (provider === 'assemblyai') {
     return {
-      // AssemblyAI bundles transcription + speaker_labels in its API
       stt: async (wav: Buffer) => {
         const upRes = await fetch('https://api.assemblyai.com/v2/upload', {
           method: 'POST',
@@ -214,6 +347,8 @@ function resolveSttAndDiarize(settings: NectarSettings): {
         }
         return { text: '' }
       },
+      diarize,
+      useStreamingWs: false,
     }
   }
 
@@ -221,14 +356,16 @@ function resolveSttAndDiarize(settings: NectarSettings): {
     return {
       stt: {
         url: 'https://api.openai.com/v1/audio/transcriptions',
-        model: settings.cloudSttModel || 'gpt-4o-transcribe',
+        model: settings.sttModel || 'gpt-4o-transcribe',
         apiKey,
       },
+      diarize,
+      useStreamingWs: false,
     }
   }
 
   if (provider === 'gemini') {
-    const model = settings.cloudSttModel || 'gemini-2.5-flash'
+    const model = settings.sttModel || 'gemini-2.5-flash'
     return {
       stt: async (wav: Buffer) => {
         const res = await fetch(
@@ -259,24 +396,22 @@ function resolveSttAndDiarize(settings: NectarSettings): {
             content?: { parts?: Array<{ text?: string }> }
           }>
         }
-        const text = body.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
-        return { text }
+        return { text: body.candidates?.[0]?.content?.parts?.[0]?.text ?? '' }
       },
+      diarize,
+      useStreamingWs: false,
     }
   }
 
+  const customAuth = buildAuthHeader(settings.sttAuthScheme ?? 'Bearer', apiKey)
   return {
     stt: {
       url: settings.sttUrl || 'https://api.openai.com/v1/audio/transcriptions',
       model: settings.sttModel || 'whisper-1',
-      apiKey: settings.sttApiKey || apiKey || undefined,
+      headers: customAuth ? { Authorization: customAuth } : undefined,
     },
-    diarize: settings.diarizeUrl
-      ? {
-          url: settings.diarizeUrl,
-          apiKey: settings.diarizeApiKey || undefined,
-        }
-      : undefined,
+    diarize,
+    useStreamingWs: false,
   }
 }
 
@@ -285,21 +420,53 @@ async function initSynapse(settings: NectarSettings): Promise<void> {
     await synapse.close().catch(() => {})
   }
   const synapseDbPath = path.join(getNectarDataDir(), 'synapse.db')
-  const ai = resolveAiEndpoints(settings, cortexUrl)
+  const llm = resolveLlmEndpoint(settings, cortexUrl)
+  const emb = resolveEmbeddingEndpoint(settings, cortexUrl)
 
   synapse = await Synapse.open(synapseDbPath, {
     defaultGroupId: settings.groupId,
-    chatBaseUrl: ai.baseUrl,
-    chatModel: ai.llmModel,
-    chatApiKey: ai.apiKey,
-    embeddingBaseUrl: ai.baseUrl,
-    embeddingModel: ai.embeddingModel,
-    embeddingApiKey: ai.apiKey,
+    chatBaseUrl: llm.baseUrl,
+    chatModel: llm.model,
+    chatApiKey: llm.apiKey,
+    embeddingBaseUrl: emb.baseUrl,
+    embeddingModel: emb.model,
+    embeddingApiKey: emb.apiKey,
     embeddingDimensions: 64,
     memoryHitThreshold: 0.15,
     inferenceMode: 'fake',
     consolidationMode: 'deterministic',
-    embedder: async (text: string) => deterministicEmbed(text, 64),
+    embedder: async (text: string) => {
+      if (emb.mode === 'cloud' && emb.baseUrl) {
+        try {
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+          }
+          const auth = buildAuthHeader(emb.authScheme, emb.apiKey)
+          if (auth) headers.Authorization = auth
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 8_000)
+          const res = await fetch(`${emb.baseUrl}/embeddings`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ model: emb.model || 'default', input: text }),
+            signal: controller.signal,
+          })
+          clearTimeout(timer)
+          if (res.ok) {
+            const payload = (await res.json()) as {
+              data?: Array<{ embedding?: number[] }>
+            }
+            const raw = payload.data?.[0]?.embedding
+            if (Array.isArray(raw) && raw.length > 0) {
+              return projectVector(raw, 64)
+            }
+          }
+        } catch {
+          // fall back to deterministic vector hash when offline
+        }
+      }
+      return deterministicEmbed(text, 64)
+    },
     judge: {
       async select(query, candidates) {
         if (candidates.length === 0) {
@@ -331,33 +498,97 @@ async function initSynapse(settings: NectarSettings): Promise<void> {
   })
 }
 
-async function initComputeAndPerception(settings: NectarSettings): Promise<void> {
-  if (settings.mode === 'local') {
-    cortexStatus = 'starting'
-    broadcast('status:changed', { cortexStatus })
-    try {
-      // Check if Cortex is already listening on localPort
-      const probe = await fetch(`http://127.0.0.1:${settings.localPort}/health`).catch(
-        () => null,
-      )
-      if (probe && probe.ok) {
-        cortexUrl = `http://127.0.0.1:${settings.localPort}`
-        cortexStatus = 'running'
-      } else {
-        cortexServer = await Cortex.start({ port: settings.localPort })
-        cortexUrl = cortexServer.url
-        cortexStatus = 'running'
+async function startLocalCortex(port: number): Promise<string> {
+  cortexStatus = 'starting'
+  cortexError = null
+  broadcastLocalModels(true)
+
+  const expectedUrl = `http://127.0.0.1:${port}`
+  if (cortexServer && cortexServer.port !== port) {
+    await cortexServer.stop().catch(() => {})
+    cortexServer = null
+  }
+
+  try {
+    // Check if Cortex is already listening on localPort
+    const probe = await fetch(`${expectedUrl}/health`).catch(() => null)
+    if (probe && probe.ok) {
+      const data = (await probe.json().catch(() => ({}))) as {
+        primitives?: Record<string, string>
       }
-    } catch {
-      cortexUrl = `http://127.0.0.1:${settings.localPort}`
-      cortexStatus = 'stopped'
+      cortexUrl = expectedUrl
+      cortexPrimitives = data.primitives ?? {}
+      cortexStatus = 'running'
+      cortexError = null
+    } else {
+      const modelsDir = getModelsDir()
+      const started = await Cortex.start({
+        port,
+        modelsDir,
+        stdio: 'pipe',
+      })
+      cortexServer = started
+      cortexUrl = started.url
+      cortexStatus = 'running'
+      cortexError = null
+
+      started.process.once('exit', (code, signal) => {
+        if (cortexServer !== started) return
+        cortexServer = null
+        if (store && anyServiceUsesLocal(store.getSettings())) {
+          cortexStatus = code && code !== 0 ? 'error' : 'stopped'
+          cortexError =
+            code && code !== 0
+              ? `Local Cortex runtime exited unexpectedly (code ${code}${signal ? `, ${signal}` : ''})`
+              : null
+          cortexPrimitives = {}
+          localModelsSnapshot = fallbackLocalModels(cortexStatus)
+          broadcastLocalModels(true)
+        }
+      })
+
+      const [initialHealth, models] = await Promise.all([
+        started.health().catch(() => null),
+        fetchCortexModels(started.url).catch(() => null),
+      ])
+      if (initialHealth?.primitives) {
+        cortexPrimitives = Object.fromEntries(
+          Object.entries(initialHealth.primitives).filter(
+            (entry): entry is [string, string] => typeof entry[1] === 'string',
+          ),
+        )
+      }
+      localModelsSnapshot = models ?? fallbackLocalModels('running', cortexPrimitives)
     }
+    startHealthPolling(port)
+    broadcastLocalModels(true)
+    return cortexUrl
+  } catch (err) {
+    cortexUrl = expectedUrl
+    cortexStatus = 'error'
+    cortexError = err instanceof Error ? err.message : String(err)
+    cortexPrimitives = {}
+    localModelsSnapshot = fallbackLocalModels('error')
+    startHealthPolling(port)
+    broadcastLocalModels(true)
+    throw err
+  }
+}
+
+async function initComputeAndPerception(settings: NectarSettings): Promise<void> {
+  if (anyServiceUsesLocal(settings)) {
+    await startLocalCortex(settings.localPort).catch(() => {})
   } else {
+    stopHealthPolling()
     if (cortexServer) {
       await cortexServer.stop().catch(() => {})
       cortexServer = null
     }
     cortexStatus = 'cloud'
+    cortexError = null
+    cortexPrimitives = {}
+    localModelsSnapshot = fallbackLocalModels('cloud')
+    broadcastLocalModels(true)
   }
 
   await initSynapse(settings)
@@ -391,7 +622,7 @@ async function initComputeAndPerception(settings: NectarSettings): Promise<void>
     })
   }
 
-  broadcast('status:changed', { cortexStatus, cortexUrl })
+  broadcastLocalModels(true)
 }
 
 async function seedInitialWorkspaceIfEmpty(): Promise<void> {
@@ -422,7 +653,7 @@ async function seedInitialWorkspaceIfEmpty(): Promise<void> {
     createdAt: '2026-03-10T17:05:00.000Z',
   })
   const marchFull = store.getMeeting(marchMeeting.id)!
-  const marchDistilled = await distillMeeting(marchFull, settings, cortexUrl)
+  const marchDistilled = deterministicDistill(marchFull)
   store.updateMeeting(marchMeeting.id, {
     distilledNotes: marchDistilled.distilledNotes,
     actionItems: marchDistilled.actionItems,
@@ -481,7 +712,7 @@ async function seedInitialWorkspaceIfEmpty(): Promise<void> {
   })
 
   const q4Full = store.getMeeting(q4Meeting.id)!
-  const q4Distilled = await distillMeeting(q4Full, settings, cortexUrl)
+  const q4Distilled = deterministicDistill(q4Full)
   store.updateMeeting(q4Meeting.id, {
     distilledNotes: q4Distilled.distilledNotes,
     actionItems: q4Distilled.actionItems,
@@ -568,31 +799,19 @@ async function getFullAppState() {
   const permissions = aira
     ? await aira.checkPermissions(false).catch(() => ({}))
     : { accessibility: 'granted', microphone: 'granted', 'system-audio': 'granted' }
-  const [entities, relationships, statements, skills, patterns] = await Promise.all([
-    synapse.entities(settings.groupId),
-    synapse.relationships(settings.groupId, { includeSuperseded: true }),
-    synapse.statements(settings.groupId, { includeSuperseded: true }),
-    synapse.skills(settings.groupId),
-    synapse.patterns(settings.groupId),
-  ])
 
   return {
     settings,
     cortexStatus,
     cortexUrl,
-    cortexPrimitives,
+    cortexError,
+    localModels: localModelsSnapshot,
+    streamingWs: streamingWsStatus,
     detectedMeetings,
     activeCaptureMeetingId,
     capturePaused,
     permissions,
     meetings,
-    graph: {
-      entities,
-      relationships,
-      statements,
-      skills,
-      patterns,
-    },
     mcp: {
       url: mcpServer.url,
       port: mcpServer.port,
@@ -612,12 +831,16 @@ function registerIpcHandlers(): void {
   ipcMain.handle('nectar:saveSettings', async (_e, patch: Partial<NectarSettings>) => {
     const prev = store.getSettings()
     const updated = store.saveSettings(patch)
-    if (prev.mode !== updated.mode || prev.localPort !== updated.localPort) {
+    const prevLocal = anyServiceUsesLocal(prev)
+    const nextLocal = anyServiceUsesLocal(updated)
+    if (prevLocal !== nextLocal || prev.localPort !== updated.localPort) {
       await initComputeAndPerception(updated)
     } else {
       await initSynapse(updated)
     }
-    return getFullAppState()
+    const nextState = await getFullAppState()
+    broadcast('state:refresh', nextState)
+    return nextState
   })
 
   ipcMain.handle('nectar:checkPermissions', async (_e, prompt: boolean) => {
@@ -633,6 +856,98 @@ function registerIpcHandlers(): void {
     broadcast('permissions:changed', { permissions: perms })
     return perms
   })
+
+  ipcMain.handle('nectar:completeOnboarding', async () => {
+    store.saveSettings({ onboardingCompleted: true })
+    const nextState = await getFullAppState()
+    broadcast('state:refresh', nextState)
+    return nextState
+  })
+
+  ipcMain.handle('nectar:refreshLocalModels', async () => {
+    const settings = store.getSettings()
+    if (anyServiceUsesLocal(settings)) {
+      await pollCortexHealth(settings.localPort)
+    }
+    broadcastLocalModels(true)
+    return getLocalModelsPayload()
+  })
+
+  const ensureCortexBaseUrl = async (): Promise<string> => {
+    const settings = store.getSettings()
+    if (cortexStatus === 'running' && cortexUrl) return cortexUrl
+    return startLocalCortex(settings.localPort)
+  }
+
+  ipcMain.handle('nectar:downloadLocalModel', async (_e, modelId: LocalModelId) => {
+    const baseUrl = await ensureCortexBaseUrl()
+    await startCortexModelDownload(baseUrl, modelId)
+    await pollCortexHealth(store.getSettings().localPort)
+    return { ok: true }
+  })
+
+  ipcMain.handle(
+    'nectar:downloadAllLocalModels',
+    async (_e, modelIds?: LocalModelId[]) => {
+      const targets: LocalModelId[] =
+        Array.isArray(modelIds) && modelIds.length > 0
+          ? modelIds
+          : ['stt', 'diarize', 'chat', 'embed']
+      const baseUrl = await ensureCortexBaseUrl()
+      await Promise.all(
+        targets.map((id) => startCortexModelDownload(baseUrl, id).catch(() => {})),
+      )
+      await pollCortexHealth(store.getSettings().localPort)
+      return { ok: true }
+    },
+  )
+
+  ipcMain.handle(
+    'nectar:cancelLocalModelDownload',
+    async (_e, modelId: LocalModelId) => {
+      if (cortexUrl && cortexStatus === 'running') {
+        await cancelCortexModelDownload(cortexUrl, modelId).catch(() => {})
+        await pollCortexHealth(store.getSettings().localPort)
+      }
+      return { ok: true }
+    },
+  )
+
+  ipcMain.handle('nectar:restartCortex', async () => {
+    const settings = store.getSettings()
+    if (anyServiceUsesLocal(settings)) {
+      if (cortexServer) {
+        await cortexServer.stop().catch(() => {})
+        cortexServer = null
+      }
+      await startLocalCortex(settings.localPort).catch(() => {})
+    }
+    const nextState = await getFullAppState()
+    broadcast('state:refresh', nextState)
+    return nextState
+  })
+
+  ipcMain.handle('nectar:openModelsFolder', async () => {
+    const dir = getModelsDir()
+    await shell.openPath(dir).catch(() => {})
+    return { ok: true, path: dir }
+  })
+
+  ipcMain.handle(
+    'nectar:testSttConnection',
+    async (
+      _e,
+      config: {
+        url: string
+        apiKey?: string
+        authScheme?: AuthScheme
+        language?: string
+        mode?: 'meeting' | 'call'
+      },
+    ) => {
+      return testStreamingWsConnection(config)
+    },
+  )
 
   ipcMain.handle(
     'nectar:createMeeting',
@@ -713,6 +1028,10 @@ function registerIpcHandlers(): void {
       const perms = await aira.checkPermissions(true).catch(() => ({}))
       broadcast('permissions:changed', { permissions: perms })
 
+      if (activeStreamingWs) {
+        await activeStreamingWs.finish().catch(() => {})
+        activeStreamingWs = null
+      }
       if (activeCaptureSession) {
         await activeCaptureSession.close().catch(() => {})
         activeCaptureSession = null
@@ -741,62 +1060,138 @@ function registerIpcHandlers(): void {
       const settings = store.getSettings()
       const resolved = resolveSttAndDiarize(settings)
 
+      if (resolved.useStreamingWs) {
+        const wsSession = new StreamingWsSession(
+          {
+            url: settings.sttUrl,
+            apiKey: settings.sttApiKey,
+            authScheme: settings.sttAuthScheme ?? 'Api-Key',
+            language: settings.sttLanguage || 'auto',
+            mode: settings.sttWsMode || 'meeting',
+            maxSpeakers: 8,
+          },
+          {
+            onStatus: (nextStatus) => {
+              streamingWsStatus = nextStatus
+              broadcast('streaming:status', { streamingWs: nextStatus })
+            },
+            onSegment: (seg) => {
+              const cleanedText = cleanWhisperText(seg.text)
+              if (!cleanedText) return
+              const turn = store.addTranscriptTurn({
+                meetingId: meeting.id,
+                speaker: seg.speaker || 'speaker_0',
+                participantId: seg.speaker || null,
+                text: cleanedText,
+                t0: seg.start,
+                t1: seg.end,
+              })
+              synapse
+                .ingest(
+                  {
+                    speaker: turn.speaker,
+                    participantId: turn.participantId,
+                    text: turn.text,
+                    t0: turn.t0,
+                    t1: turn.t1,
+                    partial: false,
+                    conversationId: meeting.id,
+                    sourceId: `turn-${turn.id}`,
+                  },
+                  settings.groupId,
+                )
+                .catch(() => {})
+              broadcast('meeting:turn', {
+                meetingId: meeting.id,
+                turn,
+                meeting: store.getMeeting(meeting.id),
+              })
+            },
+            onPartial: (partial) => {
+              if (!partial) {
+                broadcast('meeting:partial', { meetingId: meeting.id, text: '' })
+                return
+              }
+              const cleanedText = cleanWhisperText(partial.text)
+              if (cleanedText) {
+                broadcast('meeting:partial', {
+                  meetingId: meeting.id,
+                  speaker: partial.speaker || 'speaker_0',
+                  text: cleanedText,
+                  t0: partial.start,
+                })
+              }
+            },
+          },
+        )
+        activeStreamingWs = wsSession
+        wsSession.start()
+      }
+
       const session = aira.startMeeting(resolvedTarget, {
         stt: resolved.stt,
         diarize: resolved.diarize,
       })
       activeCaptureSession = session
 
-      session.on('audio', (chunk: { sysRMS?: number; micRMS?: number }) => {
-        if (!capturePaused) {
-          const level = Math.max(chunk.sysRMS ?? 0, chunk.micRMS ?? 0)
-          broadcast('audio:level', { level })
-        }
-      })
-
-      ;(async () => {
-        for await (const ev of session.events) {
-          if (capturePaused) continue
-          if (ev.type === 'transcript') {
-            const cleanedText = cleanWhisperText(ev.text)
-            if (!ev.partial && cleanedText) {
-              const turn = store.addTranscriptTurn({
-                meetingId: meeting.id,
-                speaker: ev.name || 'You',
-                participantId: ev.participantId ?? null,
-                text: cleanedText,
-                t0: ev.t0,
-                t1: ev.t1,
-              })
-              await synapse.ingest(
-                {
-                  speaker: turn.speaker,
-                  participantId: turn.participantId,
-                  text: turn.text,
-                  t0: turn.t0,
-                  t1: turn.t1,
-                  partial: false,
-                  conversationId: meeting.id,
-                  sourceId: `turn-${turn.id}`,
-                },
-                settings.groupId,
-              )
-              broadcast('meeting:turn', {
-                meetingId: meeting.id,
-                turn,
-                meeting: store.getMeeting(meeting.id),
-              })
-            } else if (ev.partial && cleanedText) {
-              broadcast('meeting:partial', {
-                meetingId: meeting.id,
-                speaker: ev.name || 'You',
-                text: cleanedText,
-                t0: ev.t0,
-              })
+      session.on(
+        'audio',
+        (chunk: { pcm?: Buffer; sysRMS?: number; micRMS?: number }) => {
+          if (!capturePaused) {
+            const level = Math.max(chunk.sysRMS ?? 0, chunk.micRMS ?? 0)
+            broadcast('audio:level', { level })
+            if (activeStreamingWs && chunk.pcm && chunk.pcm.length > 0) {
+              activeStreamingWs.feedPcm(chunk.pcm)
             }
           }
-        }
-      })().catch(() => {})
+        },
+      )
+
+      if (!resolved.useStreamingWs) {
+        ;(async () => {
+          for await (const ev of session.events) {
+            if (capturePaused) continue
+            if (ev.type === 'transcript') {
+              const cleanedText = cleanWhisperText(ev.text)
+              if (!ev.partial && cleanedText) {
+                const turn = store.addTranscriptTurn({
+                  meetingId: meeting.id,
+                  speaker: ev.name || 'You',
+                  participantId: ev.participantId ?? null,
+                  text: cleanedText,
+                  t0: ev.t0,
+                  t1: ev.t1,
+                })
+                await synapse.ingest(
+                  {
+                    speaker: turn.speaker,
+                    participantId: turn.participantId,
+                    text: turn.text,
+                    t0: turn.t0,
+                    t1: turn.t1,
+                    partial: false,
+                    conversationId: meeting.id,
+                    sourceId: `turn-${turn.id}`,
+                  },
+                  settings.groupId,
+                )
+                broadcast('meeting:turn', {
+                  meetingId: meeting.id,
+                  turn,
+                  meeting: store.getMeeting(meeting.id),
+                })
+              } else if (ev.partial && cleanedText) {
+                broadcast('meeting:partial', {
+                  meetingId: meeting.id,
+                  speaker: ev.name || 'You',
+                  text: cleanedText,
+                  t0: ev.t0,
+                })
+              }
+            }
+          }
+        })().catch(() => {})
+      }
 
       broadcast('state:refresh', await getFullAppState())
       return meeting
@@ -863,10 +1258,21 @@ function registerIpcHandlers(): void {
       clearInterval(simulationTimer)
       simulationTimer = null
     }
+    if (activeStreamingWs) {
+      await activeStreamingWs.finish().catch(() => {})
+      activeStreamingWs = null
+    }
     if (activeCaptureSession) {
       await activeCaptureSession.close().catch(() => {})
       activeCaptureSession = null
     }
+    streamingWsStatus = {
+      status: 'idle',
+      numSpeakers: 0,
+      lastLatencyMs: null,
+      error: null,
+    }
+    broadcast('streaming:status', { streamingWs: streamingWsStatus })
     const stoppedMeetingId = activeCaptureMeetingId
     activeCaptureMeetingId = null
     capturePaused = false
@@ -980,55 +1386,6 @@ function registerIpcHandlers(): void {
 
     return meeting
   })
-
-  ipcMain.handle('nectar:recall', async (_e, query: string) => {
-    const settings = store.getSettings()
-    const res = await synapse.recall(query, settings.groupId)
-    await synapse.detectProcedures(settings.groupId).catch(() => {})
-    broadcast('state:refresh', await getFullAppState())
-    return res
-  })
-
-  ipcMain.handle('nectar:getKnowledgeGraph', async (_e, includeSuperseded = true) => {
-    const settings = store.getSettings()
-    const [entities, relationships, statements, skills, patterns] = await Promise.all([
-      synapse.entities(settings.groupId),
-      synapse.relationships(settings.groupId, { includeSuperseded }),
-      synapse.statements(settings.groupId, { includeSuperseded }),
-      synapse.skills(settings.groupId),
-      synapse.patterns(settings.groupId),
-    ])
-    return { entities, relationships, statements, skills, patterns }
-  })
-
-  ipcMain.handle('nectar:consolidateMemory', async () => {
-    const settings = store.getSettings()
-    const run = await synapse.consolidate(settings.groupId)
-    broadcast('state:refresh', await getFullAppState())
-    return run
-  })
-
-  ipcMain.handle('nectar:detectProcedures', async () => {
-    const settings = store.getSettings()
-    const res = await synapse.detectProcedures(settings.groupId)
-    broadcast('state:refresh', await getFullAppState())
-    return res
-  })
-
-  ipcMain.handle(
-    'nectar:setSkillStatus',
-    async (_e, skillId: string, status: 'candidate' | 'approved' | 'rejected') => {
-      const settings = store.getSettings()
-      await synapse.proceduralService.setStatus(
-        skillId,
-        status,
-        settings.groupId,
-        synapse.session,
-      )
-      broadcast('state:refresh', await getFullAppState())
-      return { ok: true }
-    },
-  )
 
   ipcMain.handle(
     'nectar:installMcp',
@@ -1268,7 +1625,9 @@ app.whenReady().then(async () => {
   await mcpServer.start(settings.mcpPort)
 
   await initComputeAndPerception(settings)
-  await pollCortexHealth(settings.localPort)
+  if (anyServiceUsesLocal(settings)) {
+    await pollCortexHealth(settings.localPort)
+  }
 
   await seedInitialWorkspaceIfEmpty()
 
@@ -1284,8 +1643,9 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', async () => {
-  if (healthPollTimer) clearInterval(healthPollTimer)
+  stopHealthPolling()
   if (simulationTimer) clearInterval(simulationTimer)
+  if (activeStreamingWs) await activeStreamingWs.finish(1000).catch(() => {})
   if (activeCaptureSession) await activeCaptureSession.close().catch(() => {})
   if (watcher) watcher.close()
   if (aira) await aira.close().catch(() => {})

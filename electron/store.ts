@@ -4,42 +4,56 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-export type CloudSttProvider = 'deepgram' | 'assemblyai' | 'openai' | 'gemini' | 'custom'
-export type CloudAiProvider = 'openai' | 'gemini' | 'custom'
+export type ServiceMode = 'local' | 'cloud'
+export type AuthScheme = 'Bearer' | 'Api-Key' | 'Token' | 'none'
+export type CloudSttProvider =
+  | 'websocket'
+  | 'deepgram'
+  | 'assemblyai'
+  | 'openai'
+  | 'gemini'
+  | 'custom'
+export type CloudAiProvider = 'openai-compatible' | 'openai' | 'gemini' | 'custom'
 
 export interface NectarSettings {
-  mode: 'local' | 'cloud'
+  mode: 'local' | 'cloud' | 'hybrid'
+  onboardingCompleted: boolean
   groupId: string
   localPort: number
   mcpPort: number
 
-  // Cloud simplified presets
+  // Per-service runtime mode (mix & match Local and Cloud independently)
+  sttMode: ServiceMode
+  diarizeMode: ServiceMode
+  llmMode: ServiceMode
+  embeddingMode: ServiceMode
+  sttIncludesDiarization: boolean
+
+  // Cloud provider selectors
   cloudSttProvider: CloudSttProvider
-  cloudSttModel: string
-  cloudSttApiKey: string
-
   cloudAiProvider: CloudAiProvider
-  cloudLlmModel: string
-  cloudEmbeddingModel: string
-  cloudAiApiKey: string
 
-  // Custom / Low-level overrides (auto-populated from presets)
+  // Per-service endpoint, auth scheme, model & key configuration
   sttUrl: string
   sttModel: string
   sttApiKey: string
+  sttAuthScheme: AuthScheme
+  sttWsMode: 'meeting' | 'call'
+  sttLanguage: string
 
   diarizeUrl: string
-  diarizeModel: string
   diarizeApiKey: string
+  diarizeAuthScheme: AuthScheme
 
   llmBaseUrl: string
   llmModel: string
   llmApiKey: string
+  llmAuthScheme: AuthScheme
 
   embeddingBaseUrl: string
   embeddingModel: string
-  embeddingDimensions: number
   embeddingApiKey: string
+  embeddingAuthScheme: AuthScheme
 }
 
 export interface ActionItem {
@@ -76,40 +90,108 @@ export interface MeetingRecord {
   turns: TranscriptTurnRow[]
 }
 
-export const LOCAL_PRESET: Omit<NectarSettings, 'mode' | 'groupId' | 'localPort' | 'mcpPort'> = {
-  cloudSttProvider: 'deepgram',
-  cloudSttModel: '',
-  cloudSttApiKey: '',
-
-  cloudAiProvider: 'openai',
-  cloudLlmModel: '',
-  cloudEmbeddingModel: '',
-  cloudAiApiKey: '',
-
-  sttUrl: 'http://127.0.0.1:8000/v1/audio/transcriptions',
-  sttModel: '',
-  sttApiKey: '',
-
-  diarizeUrl: 'http://127.0.0.1:8000/v1/audio/diarize',
-  diarizeModel: '',
-  diarizeApiKey: '',
-
-  llmBaseUrl: 'http://127.0.0.1:8000/v1',
-  llmModel: '',
-  llmApiKey: '',
-
-  embeddingBaseUrl: 'http://127.0.0.1:8000/v1',
-  embeddingModel: '',
-  embeddingDimensions: 768,
-  embeddingApiKey: '',
-}
-
 export const DEFAULT_SETTINGS: NectarSettings = {
   mode: 'local',
+  onboardingCompleted: false,
   groupId: 'workspace',
   localPort: 8000,
   mcpPort: 4577,
-  ...LOCAL_PRESET,
+
+  sttMode: 'local',
+  diarizeMode: 'local',
+  llmMode: 'local',
+  embeddingMode: 'local',
+  sttIncludesDiarization: false,
+
+  cloudSttProvider: 'websocket',
+  cloudAiProvider: 'openai-compatible',
+
+  sttUrl: '',
+  sttModel: '',
+  sttApiKey: '',
+  sttAuthScheme: 'Api-Key',
+  sttWsMode: 'meeting',
+  sttLanguage: 'auto',
+
+  diarizeUrl: '',
+  diarizeApiKey: '',
+  diarizeAuthScheme: 'Api-Key',
+
+  llmBaseUrl: '',
+  llmModel: '',
+  llmApiKey: '',
+  llmAuthScheme: 'Bearer',
+
+  embeddingBaseUrl: '',
+  embeddingModel: '',
+  embeddingApiKey: '',
+  embeddingAuthScheme: 'Api-Key',
+}
+
+export function getEffectiveServiceModes(settings: NectarSettings): {
+  stt: ServiceMode
+  diarize: ServiceMode
+  llm: ServiceMode
+  embedding: ServiceMode
+} {
+  const stt = settings.sttMode ?? (settings.mode === 'cloud' ? 'cloud' : 'local')
+  const diarize =
+    stt === 'cloud' && settings.sttIncludesDiarization
+      ? 'cloud'
+      : settings.diarizeMode ?? (settings.mode === 'cloud' ? 'cloud' : 'local')
+  const llm = settings.llmMode ?? (settings.mode === 'cloud' ? 'cloud' : 'local')
+  const embedding =
+    settings.embeddingMode ?? (settings.mode === 'cloud' ? 'cloud' : 'local')
+  return { stt, diarize, llm, embedding }
+}
+
+export function computeOverallMode(
+  settings: NectarSettings,
+): 'local' | 'cloud' | 'hybrid' {
+  const m = getEffectiveServiceModes(settings)
+  const list = [m.stt, m.diarize, m.llm, m.embedding]
+  if (list.every((x) => x === 'local')) return 'local'
+  if (list.every((x) => x === 'cloud')) return 'cloud'
+  return 'hybrid'
+}
+
+export function anyServiceUsesLocal(settings: NectarSettings): boolean {
+  const m = getEffectiveServiceModes(settings)
+  return (
+    m.stt === 'local' ||
+    m.diarize === 'local' ||
+    m.llm === 'local' ||
+    m.embedding === 'local'
+  )
+}
+
+interface LegacySettingsFields {
+  cloudSttModel?: string
+  cloudSttApiKey?: string
+  cloudLlmModel?: string
+  cloudEmbeddingModel?: string
+  cloudAiApiKey?: string
+}
+
+export function normalizeSettings(
+  raw: Partial<NectarSettings> & LegacySettingsFields,
+): NectarSettings {
+  const fallbackMode: ServiceMode = raw.mode === 'cloud' ? 'cloud' : 'local'
+  const merged: NectarSettings = {
+    ...DEFAULT_SETTINGS,
+    ...raw,
+    sttMode: raw.sttMode ?? fallbackMode,
+    diarizeMode: raw.diarizeMode ?? fallbackMode,
+    llmMode: raw.llmMode ?? fallbackMode,
+    embeddingMode: raw.embeddingMode ?? fallbackMode,
+    sttModel: raw.sttModel || raw.cloudSttModel || '',
+    sttApiKey: raw.sttApiKey || raw.cloudSttApiKey || '',
+    llmModel: raw.llmModel || raw.cloudLlmModel || '',
+    llmApiKey: raw.llmApiKey || raw.cloudAiApiKey || '',
+    embeddingModel: raw.embeddingModel || raw.cloudEmbeddingModel || '',
+  }
+  merged.mode = computeOverallMode(merged)
+  return merged
 }
 
 export function getNectarDataDir(): string {
@@ -175,17 +257,17 @@ export class NectarStore {
       .prepare(`SELECT value FROM settings WHERE key = 'config'`)
       .get() as { value: string } | undefined
     if (!row) {
-      return { ...DEFAULT_SETTINGS }
+      return normalizeSettings({})
     }
     try {
-      return { ...DEFAULT_SETTINGS, ...(JSON.parse(row.value) as Partial<NectarSettings>) }
+      return normalizeSettings(JSON.parse(row.value) as Partial<NectarSettings>)
     } catch {
-      return { ...DEFAULT_SETTINGS }
+      return normalizeSettings({})
     }
   }
 
   saveSettings(patch: Partial<NectarSettings>): NectarSettings {
-    const updated = { ...this.getSettings(), ...patch }
+    const updated = normalizeSettings({ ...this.getSettings(), ...patch })
     this.db
       .prepare(
         `INSERT INTO settings (key, value) VALUES ('config', ?)

@@ -1,37 +1,97 @@
-export type CloudSttProvider = 'deepgram' | 'assemblyai' | 'openai' | 'gemini' | 'custom'
-export type CloudAiProvider = 'openai' | 'gemini' | 'custom'
+export type ServiceMode = 'local' | 'cloud'
+export type AuthScheme = 'Bearer' | 'Api-Key' | 'Token' | 'none'
+export type CloudSttProvider =
+  | 'websocket'
+  | 'deepgram'
+  | 'assemblyai'
+  | 'openai'
+  | 'gemini'
+  | 'custom'
+export type CloudAiProvider = 'openai-compatible' | 'openai' | 'gemini' | 'custom'
+
+export type LocalModelId = 'stt' | 'diarize' | 'chat' | 'embed'
+
+export type LocalModelStatus =
+  | 'not_downloaded'
+  | 'downloading'
+  | 'downloaded'
+  | 'loading'
+  | 'ready'
+  | 'error'
+
+export type CortexRuntimeStatus = 'running' | 'starting' | 'stopped' | 'error' | 'cloud'
+
+export type PrimitiveRuntimeState =
+  | 'unloaded'
+  | 'loading'
+  | 'loaded'
+  | 'error'
+  | 'unavailable'
+
+export interface StreamingWsStatus {
+  status: 'idle' | 'connecting' | 'connected' | 'error'
+  numSpeakers: number
+  lastLatencyMs: number | null
+  error: string | null
+}
+
+export interface LocalModelInfo {
+  id: LocalModelId
+  name: string
+  modelName: string
+  role: string
+  engine: string
+  required: boolean
+  kind: 'coreml' | 'gguf'
+  status: LocalModelStatus
+  runtimeState: PrimitiveRuntimeState
+  installedOnDisk: boolean
+  canCancel: boolean
+  progress: number | null
+  downloadedBytes: number
+  totalBytes: number | null
+  bytesPerSec: number | null
+  detail: string | null
+  error: string | null
+  localPath: string | null
+}
 
 export interface NectarSettings {
-  mode: 'local' | 'cloud'
+  mode: 'local' | 'cloud' | 'hybrid'
+  onboardingCompleted: boolean
   groupId: string
   localPort: number
   mcpPort: number
 
-  cloudSttProvider: CloudSttProvider
-  cloudSttModel: string
-  cloudSttApiKey: string
+  sttMode: ServiceMode
+  diarizeMode: ServiceMode
+  llmMode: ServiceMode
+  embeddingMode: ServiceMode
+  sttIncludesDiarization: boolean
 
+  cloudSttProvider: CloudSttProvider
   cloudAiProvider: CloudAiProvider
-  cloudLlmModel: string
-  cloudEmbeddingModel: string
-  cloudAiApiKey: string
 
   sttUrl: string
   sttModel: string
   sttApiKey: string
+  sttAuthScheme: AuthScheme
+  sttWsMode: 'meeting' | 'call'
+  sttLanguage: string
 
   diarizeUrl: string
-  diarizeModel: string
   diarizeApiKey: string
+  diarizeAuthScheme: AuthScheme
 
   llmBaseUrl: string
   llmModel: string
   llmApiKey: string
+  llmAuthScheme: AuthScheme
 
   embeddingBaseUrl: string
   embeddingModel: string
-  embeddingDimensions: number
   embeddingApiKey: string
+  embeddingAuthScheme: AuthScheme
 }
 
 export interface ActionItem {
@@ -76,76 +136,18 @@ export interface MeetingTarget {
   title: string
 }
 
-export interface RecallCitation {
-  kind: 'episode' | 'external'
-  id: string
-  label: string
-  excerpt?: string | null
-  url?: string | null
-}
-
-export interface RecallResult {
-  query: string
-  answer: string | null
-  answerOrigin: 'episodic' | 'semantic_fallback' | 'miss'
-  citations: RecallCitation[]
-  selectedIds: string[]
-  scoreDetails: Record<string, unknown>
-  createdEpisodeId?: string | null
-  latencyMs: number
-}
-
-export interface GraphEntity {
-  id: string
-  kind: string
-  canonicalName: string
-  normalizedName: string
-  description: string | null
-  confidence: number
-  aliases: Array<{ alias: string }>
-}
-
-export interface GraphRelationship {
-  id: string
-  predicate: string
-  confidence: number
-  validAt: string
-  invalidAt: string | null
-  status: string
-  subject: GraphEntity
-  object: GraphEntity
-  evidence: Array<{ episodeId: string; excerpt: string }>
-}
-
-export interface SkillSpecView {
-  id: string
-  patternId: string
-  name: string
-  version: number
-  status: string
-  purpose: string
-  triggers: string[]
-  steps: string[]
-  confidence: number
-}
-
 export interface AppState {
   settings: NectarSettings
-  cortexStatus: 'running' | 'starting' | 'stopped' | 'cloud'
+  cortexStatus: CortexRuntimeStatus
   cortexUrl: string | null
-  cortexPrimitives: Record<string, string>
+  cortexError: string | null
+  localModels: LocalModelInfo[]
+  streamingWs: StreamingWsStatus
   detectedMeetings: MeetingTarget[]
   activeCaptureMeetingId: string | null
   capturePaused: boolean
   permissions: Record<string, string>
   meetings: MeetingRecord[]
-  graph: {
-    entities: GraphEntity[]
-    relationships: GraphRelationship[]
-    statements: Array<Record<string, unknown>>
-    skills: SkillSpecView[]
-    patterns: Array<Record<string, unknown>>
-  }
   mcp: {
     url: string
     port: number
@@ -162,6 +164,25 @@ declare global {
       getState(): Promise<AppState>
       saveSettings(patch: Partial<NectarSettings>): Promise<AppState>
       checkPermissions(prompt: boolean): Promise<Record<string, string>>
+      completeOnboarding(): Promise<AppState>
+      refreshLocalModels(): Promise<{
+        cortexStatus: CortexRuntimeStatus
+        cortexUrl: string | null
+        cortexError: string | null
+        localModels: LocalModelInfo[]
+      }>
+      downloadLocalModel(modelId: LocalModelId): Promise<{ ok: boolean }>
+      downloadAllLocalModels(modelIds?: LocalModelId[]): Promise<{ ok: boolean }>
+      cancelLocalModelDownload(modelId: LocalModelId): Promise<{ ok: boolean }>
+      restartCortex(): Promise<AppState>
+      openModelsFolder(): Promise<{ ok: boolean; path: string }>
+      testSttConnection(config: {
+        url: string
+        apiKey?: string
+        authScheme?: AuthScheme
+        language?: string
+        mode?: 'meeting' | 'call'
+      }): Promise<{ ok: boolean; latencyMs: number; message: string }>
       createMeeting(input: {
         title?: string
         platform?: string
@@ -179,14 +200,6 @@ declare global {
       focusMainWindow(): Promise<{ ok: boolean }>
       startPillDrag(): void
       dragPill(): void
-      recall(query: string): Promise<RecallResult>
-      getKnowledgeGraph(includeSuperseded?: boolean): Promise<AppState['graph']>
-      consolidateMemory(): Promise<unknown>
-      detectProcedures(): Promise<unknown>
-      setSkillStatus(
-        skillId: string,
-        status: 'candidate' | 'approved' | 'rejected',
-      ): Promise<{ ok: boolean }>
       installMcp(
         target: 'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode',
       ): Promise<{

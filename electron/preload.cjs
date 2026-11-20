@@ -4,6 +4,19 @@ contextBridge.exposeInMainWorld('nectar', {
   getState: () => ipcRenderer.invoke('nectar:getState'),
   saveSettings: (patch) => ipcRenderer.invoke('nectar:saveSettings', patch),
   checkPermissions: (prompt) => ipcRenderer.invoke('nectar:checkPermissions', prompt),
+  completeOnboarding: () => ipcRenderer.invoke('nectar:completeOnboarding'),
+
+  // Local Models & Cortex Runtime
+  refreshLocalModels: () => ipcRenderer.invoke('nectar:refreshLocalModels'),
+  downloadLocalModel: (modelId) =>
+    ipcRenderer.invoke('nectar:downloadLocalModel', modelId),
+  downloadAllLocalModels: (modelIds) =>
+    ipcRenderer.invoke('nectar:downloadAllLocalModels', modelIds),
+  cancelLocalModelDownload: (modelId) =>
+    ipcRenderer.invoke('nectar:cancelLocalModelDownload', modelId),
+  restartCortex: () => ipcRenderer.invoke('nectar:restartCortex'),
+  openModelsFolder: () => ipcRenderer.invoke('nectar:openModelsFolder'),
+  testSttConnection: (config) => ipcRenderer.invoke('nectar:testSttConnection', config),
 
   // Meetings & Notepad
   createMeeting: (input) => ipcRenderer.invoke('nectar:createMeeting', input),
@@ -22,14 +35,7 @@ contextBridge.exposeInMainWorld('nectar', {
   startPillDrag: () => ipcRenderer.send('nectar:startPillDrag'),
   dragPill: () => ipcRenderer.send('nectar:dragPill'),
 
-  // Synapse Memory & Knowledge Graph
-  recall: (query) => ipcRenderer.invoke('nectar:recall', query),
-  getKnowledgeGraph: (includeSuperseded) =>
-    ipcRenderer.invoke('nectar:getKnowledgeGraph', includeSuperseded),
-  consolidateMemory: () => ipcRenderer.invoke('nectar:consolidateMemory'),
-  detectProcedures: () => ipcRenderer.invoke('nectar:detectProcedures'),
-  setSkillStatus: (skillId, status) =>
-    ipcRenderer.invoke('nectar:setSkillStatus', skillId, status),
+  // MCP
   installMcp: (target) => ipcRenderer.invoke('nectar:installMcp', target),
 
   // Subscriptions
