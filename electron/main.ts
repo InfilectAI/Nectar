@@ -49,6 +49,7 @@ const __dirname = path.dirname(__filename)
 let mainWindow: BrowserWindow | null = null
 let mainWindowPromise: Promise<void> | null = null
 let pillWindow: BrowserWindow | null = null
+let appInitialized = false
 let store: NectarStore
 let synapse: Synapse
 let aira: Aira | null = null
@@ -1259,6 +1260,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('nectar:pauseCapture', async () => {
     capturePaused = true
+    activeStreamingWs?.setPaused(true)
     if (activeCaptureSession && 'pause' in activeCaptureSession) {
       ;(activeCaptureSession as unknown as { pause(): void }).pause()
     }
@@ -1270,6 +1272,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('nectar:resumeCapture', async () => {
     capturePaused = false
+    activeStreamingWs?.setPaused(false)
     if (activeCaptureSession && 'resume' in activeCaptureSession) {
       ;(activeCaptureSession as unknown as { resume(): void }).resume()
     }
@@ -1559,6 +1562,7 @@ async function showOrCreateMainWindow(): Promise<void> {
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.show()
+    mainWindow.moveTop()
     app.focus({ steal: true })
     mainWindow.focus()
     return
@@ -1566,6 +1570,7 @@ async function showOrCreateMainWindow(): Promise<void> {
   await createWindow()
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show()
+    mainWindow.moveTop()
     app.focus({ steal: true })
     mainWindow.focus()
   }
@@ -1665,6 +1670,7 @@ async function createPillWindow(): Promise<void> {
     height: pillHeight,
     x: db.x + db.width - pillWidth - margin,
     y: db.y + db.height - pillHeight - margin,
+    show: false,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -1690,55 +1696,74 @@ async function createPillWindow(): Promise<void> {
       search: 'view=pill',
     })
   }
+  pillWindow.showInactive()
 }
 
-app.whenReady().then(async () => {
-  store = new NectarStore()
-  // Sanitize any existing transcript turns and meeting summaries that contained raw Whisper <|...|> tokens
-  const existingTurns = store.db
-    .prepare(
-      `SELECT id, text, speaker FROM transcript_turns WHERE text LIKE '%<|%' OR speaker = 'Speaker'`,
-    )
-    .all() as Array<{ id: string; text: string; speaker: string }>
-  for (const row of existingTurns) {
-    const cleaned = cleanWhisperText(row.text)
-    const speaker = row.speaker === 'Speaker' ? 'You' : row.speaker
-    store.db
-      .prepare(`UPDATE transcript_turns SET text = ?, speaker = ? WHERE id = ?`)
-      .run(cleaned, speaker, row.id)
-  }
-
-  for (const m of store.listMeetings()) {
-    if (m.distilledNotes.includes('<|') || m.participants.includes('Speaker')) {
-      const cleanedNotes = m.distilledNotes.replace(/<\|[^|]*\|>/g, '').replace(/Speaker/g, 'You')
-      const cleanedParticipants = m.participants.map((p) => (p === 'Speaker' ? 'You' : p))
-      store.updateMeeting(m.id, {
-        distilledNotes: cleanedNotes,
-        participants: Array.from(new Set(cleanedParticipants)),
-      })
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (appInitialized) {
+      void showOrCreateMainWindow()
     }
-  }
-
-  const settings = store.getSettings()
-
-  mcpServer = new McpHttpServer(store, () => synapse)
-  await mcpServer.start(settings.mcpPort)
-
-  await initComputeAndPerception(settings)
-  if (anyServiceUsesLocal(settings)) {
-    await pollCortexHealth(settings.localPort)
-  }
-
-  await seedInitialWorkspaceIfEmpty()
-
-  registerIpcHandlers()
-  await createWindow()
-  await createPillWindow()
+  })
 
   app.on('activate', () => {
-    void showOrCreateMainWindow()
+    if (appInitialized) {
+      void showOrCreateMainWindow()
+    }
   })
-})
+
+  app.whenReady().then(async () => {
+    store = new NectarStore()
+    // Sanitize any existing transcript turns and meeting summaries that contained raw Whisper <|...|> tokens
+    const existingTurns = store.db
+      .prepare(
+        `SELECT id, text, speaker FROM transcript_turns WHERE text LIKE '%<|%' OR speaker = 'Speaker'`,
+      )
+      .all() as Array<{ id: string; text: string; speaker: string }>
+    for (const row of existingTurns) {
+      const cleaned = cleanWhisperText(row.text)
+      const speaker = row.speaker === 'Speaker' ? 'You' : row.speaker
+      store.db
+        .prepare(`UPDATE transcript_turns SET text = ?, speaker = ? WHERE id = ?`)
+        .run(cleaned, speaker, row.id)
+    }
+
+    for (const m of store.listMeetings()) {
+      if (m.distilledNotes.includes('<|') || m.participants.includes('Speaker')) {
+        const cleanedNotes = m.distilledNotes
+          .replace(/<\|[^|]*\|>/g, '')
+          .replace(/Speaker/g, 'You')
+        const cleanedParticipants = m.participants.map((p) =>
+          p === 'Speaker' ? 'You' : p,
+        )
+        store.updateMeeting(m.id, {
+          distilledNotes: cleanedNotes,
+          participants: Array.from(new Set(cleanedParticipants)),
+        })
+      }
+    }
+
+    const settings = store.getSettings()
+
+    mcpServer = new McpHttpServer(store, () => synapse)
+    await mcpServer.start(settings.mcpPort)
+
+    await initComputeAndPerception(settings)
+    if (anyServiceUsesLocal(settings)) {
+      await pollCortexHealth(settings.localPort)
+    }
+
+    await seedInitialWorkspaceIfEmpty()
+
+    registerIpcHandlers()
+    appInitialized = true
+    await createPillWindow()
+    await showOrCreateMainWindow()
+  })
+}
 
 app.on('before-quit', async () => {
   stopHealthPolling()
