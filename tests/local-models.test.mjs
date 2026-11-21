@@ -298,6 +298,46 @@ describe('StreamingWsSession', () => {
       wss.close()
     }
   })
+
+  it('pads silent gaps with 100ms zero PCM16 frames and pauses padding when paused', async () => {
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' })
+    await new Promise((resolve) => wss.once('listening', resolve))
+    const addr = wss.address()
+    const appendedFrames = []
+
+    wss.on('connection', (ws) => {
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString())
+        if (msg.type === 'input_audio_buffer.append') {
+          appendedFrames.push(Buffer.from(msg.audio, 'base64'))
+        } else if (msg.type === 'input_audio_buffer.commit') {
+          ws.send(JSON.stringify({ type: 'transcription', is_final: true, segments: [] }))
+        }
+      })
+    })
+
+    const session = new StreamingWsSession(
+      { url: `ws://127.0.0.1:${addr.port}`, authScheme: 'none' },
+      {},
+    )
+    try {
+      session.start()
+      // Wait ~420ms without feeding any audio -> should emit >=2 zero-filled 3200-byte frames
+      await new Promise((r) => setTimeout(r, 420))
+      const countBeforePause = appendedFrames.length
+      assert.ok(countBeforePause >= 2, `Expected >=2 silence frames, got ${countBeforePause}`)
+      assert.equal(appendedFrames[0].length, 3200)
+      assert.equal(appendedFrames[0].every((b) => b === 0), true)
+
+      session.setPaused(true)
+      await new Promise((r) => setTimeout(r, 320))
+      assert.equal(appendedFrames.length, countBeforePause, 'Expected no frames while paused')
+
+      await session.finish(1000)
+    } finally {
+      wss.close()
+    }
+  })
 })
 
 describe('Cloud API smoke-test validator & legacy preset cleanup', () => {

@@ -50,12 +50,18 @@ export function buildAuthHeader(
 }
 
 const FRAME_BYTES = 3200 // 100 ms of 16 kHz mono PCM16
+const SILENCE_FRAME_B64 = Buffer.alloc(FRAME_BYTES).toString('base64')
+const SILENCE_TICK_MS = 100
+const SILENCE_GAP_MS = 150
 const MAX_PENDING_BYTES = 32000 * 15 // cap buffered pre-open audio at 15s
 
 export class StreamingWsSession {
   private ws: WebSocket | null = null
   private closed = false
   private open = false
+  private paused = false
+  private lastFrameSentAt = 0
+  private silenceTimer: NodeJS.Timeout | null = null
   private pcmRemainder: Buffer = Buffer.alloc(0)
   private pendingFrames: Buffer[] = []
   private pendingBytes = 0
@@ -118,7 +124,9 @@ export class StreamingWsSession {
       }
       ws.send(JSON.stringify(handshake))
       this.emitStatus('connected', null)
+      this.lastFrameSentAt = Date.now()
       this.flushPending()
+      this.startSilencePadding()
     })
 
     ws.on('message', (raw) => {
@@ -208,6 +216,7 @@ export class StreamingWsSession {
 
     ws.on('close', () => {
       this.open = false
+      this.stopSilencePadding()
       if (this.finalPromiseResolve) {
         this.finalPromiseResolve()
         this.finalPromiseResolve = null
@@ -218,8 +227,15 @@ export class StreamingWsSession {
     })
   }
 
+  setPaused(paused: boolean): void {
+    this.paused = paused
+    if (!paused) {
+      this.lastFrameSentAt = Date.now()
+    }
+  }
+
   feedPcm(pcm: Buffer | Uint8Array): void {
-    if (this.closed || !pcm || pcm.byteLength === 0) return
+    if (this.closed || this.paused || !pcm || pcm.byteLength === 0) return
     const incoming = Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm)
     let buf = this.pcmRemainder.length > 0 ? Buffer.concat([this.pcmRemainder, incoming]) : incoming
 
@@ -231,8 +247,40 @@ export class StreamingWsSession {
     this.pcmRemainder = buf.length > 0 ? Buffer.from(buf) : Buffer.alloc(0)
   }
 
+  private startSilencePadding(): void {
+    this.stopSilencePadding()
+    this.silenceTimer = setInterval(() => {
+      if (
+        this.closed ||
+        this.paused ||
+        !this.open ||
+        !this.ws ||
+        this.ws.readyState !== WebSocket.OPEN
+      ) {
+        return
+      }
+      if (Date.now() - this.lastFrameSentAt >= SILENCE_GAP_MS) {
+        this.lastFrameSentAt = Date.now()
+        this.ws.send(
+          JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: SILENCE_FRAME_B64,
+          }),
+        )
+      }
+    }, SILENCE_TICK_MS)
+  }
+
+  private stopSilencePadding(): void {
+    if (this.silenceTimer) {
+      clearInterval(this.silenceTimer)
+      this.silenceTimer = null
+    }
+  }
+
   private sendOrQueueFrame(frame: Buffer): void {
     if (this.open && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.lastFrameSentAt = Date.now()
       this.ws.send(
         JSON.stringify({
           type: 'input_audio_buffer.append',
@@ -254,6 +302,7 @@ export class StreamingWsSession {
     while (this.pendingFrames.length > 0) {
       const frame = this.pendingFrames.shift()!
       this.pendingBytes -= frame.length
+      this.lastFrameSentAt = Date.now()
       this.ws.send(
         JSON.stringify({
           type: 'input_audio_buffer.append',
@@ -266,6 +315,7 @@ export class StreamingWsSession {
   async finish(timeoutMs: number = 3500): Promise<void> {
     if (this.closed) return
     this.closed = true
+    this.stopSilencePadding()
 
     if (this.ws && this.open && this.ws.readyState === WebSocket.OPEN) {
       if (this.pcmRemainder.length > 0) {
