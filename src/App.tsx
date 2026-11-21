@@ -27,6 +27,7 @@ import {
   getSelectedLocalModelIds,
 } from './components/DownloadConfirmModal'
 import { GranolaHandle } from './components/GranolaHandle'
+import { MarkdownView } from './components/MarkdownView'
 import { formatBytes } from './utils/format'
 import { OnboardingWizard } from './components/OnboardingWizard'
 import { ServiceStackEditor } from './components/ServiceStackEditor'
@@ -906,10 +907,14 @@ export default function App() {
                       )}
 
                       <div className="rounded-[4px] border border-rail bg-well p-6">
-                        <pre className="whitespace-pre-wrap font-sans text-[14px] leading-relaxed text-ink">
-                          {selectedMeeting.distilledNotes ||
-                            'No summary generated yet. Click "Enhance Notes" above.'}
-                        </pre>
+                        {selectedMeeting.distilledNotes ? (
+                          <MarkdownView content={selectedMeeting.distilledNotes} />
+                        ) : (
+                          <p className="text-[14px] leading-relaxed text-muted">
+                            No summary generated yet. Click &ldquo;Enhance Notes&rdquo;
+                            above.
+                          </p>
+                        )}
                       </div>
                     </div>
                   </div>
