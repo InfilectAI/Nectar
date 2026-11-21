@@ -2,7 +2,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { app, BrowserWindow, ipcMain, screen, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, screen, shell } from 'electron'
 
 import { Aira, type EyesSession, type MeetingTarget, type MeetingWatcher, type STTProviderInput } from '@infilectai/aira'
 import { Cortex, type CortexServer } from '@infilectai/cortex'
@@ -50,6 +50,7 @@ let mainWindow: BrowserWindow | null = null
 let mainWindowPromise: Promise<void> | null = null
 let pillWindow: BrowserWindow | null = null
 let appInitialized = false
+let isQuitting = false
 let store: NectarStore
 let synapse: Synapse
 let aira: Aira | null = null
@@ -1559,6 +1560,13 @@ function registerIpcHandlers(): void {
 }
 
 async function showOrCreateMainWindow(): Promise<void> {
+  if (app.dock) {
+    await app.dock.show()
+    const iconPath = path.join(__dirname, '..', 'public', 'icon.png')
+    if (fs.existsSync(iconPath)) {
+      app.dock.setIcon(iconPath)
+    }
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.show()
@@ -1608,6 +1616,9 @@ async function createWindow(): Promise<void> {
     win.on('closed', () => {
       if (mainWindow === win) {
         mainWindow = null
+        if (!isQuitting) {
+          app.dock?.hide()
+        }
       }
     })
 
@@ -1671,6 +1682,8 @@ async function createPillWindow(): Promise<void> {
     x: db.x + db.width - pillWidth - margin,
     y: db.y + db.height - pillHeight - margin,
     show: false,
+    type: process.platform === 'darwin' ? 'panel' : undefined,
+    title: '',
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -1686,7 +1699,35 @@ async function createPillWindow(): Promise<void> {
     },
   })
 
-  pillWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  pillWindow.on('page-title-updated', (event) => {
+    event.preventDefault()
+  })
+
+  pillWindow.setVisibleOnAllWorkspaces(true, {
+    visibleOnFullScreen: true,
+    skipTransformProcessType: true,
+  })
+
+  pillWindow.webContents.on('context-menu', () => {
+    const menu = Menu.buildFromTemplate([
+      {
+        label: 'Open Nectar',
+        click: () => {
+          void showOrCreateMainWindow()
+        },
+      },
+      { type: 'separator' },
+      {
+        label: 'Quit Nectar',
+        click: () => {
+          app.quit()
+        },
+      },
+    ])
+    if (pillWindow && !pillWindow.isDestroyed()) {
+      menu.popup({ window: pillWindow })
+    }
+  })
 
   const devUrl = process.env.VITE_DEV_SERVER_URL
   if (devUrl) {
@@ -1766,6 +1807,11 @@ if (!gotSingleInstanceLock) {
 }
 
 app.on('before-quit', async () => {
+  isQuitting = true
+  if (pillWindow && !pillWindow.isDestroyed()) {
+    pillWindow.destroy()
+    pillWindow = null
+  }
   stopHealthPolling()
   if (simulationTimer) clearInterval(simulationTimer)
   if (activeStreamingWs) await activeStreamingWs.finish(1000).catch(() => {})
