@@ -366,6 +366,8 @@ export class NectarStore {
     id: string,
     patch: Partial<{
       title: string
+      platform: string
+      url: string
       endedAt: string | null
       status: 'recording' | 'completed'
       participants: string[]
@@ -382,13 +384,15 @@ export class NectarStore {
     this.db
       .prepare(
         `UPDATE meetings SET
-          title = ?, ended_at = ?, status = ?, participants = ?,
+          title = ?, platform = ?, url = ?, ended_at = ?, status = ?, participants = ?,
           rough_notes = ?, distilled_notes = ?, action_items = ?,
           decisions = ?, episode_id = ?
         WHERE id = ?`,
       )
       .run(
         patch.title ?? current.title,
+        patch.platform ?? current.platform,
+        patch.url ?? current.url,
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         patch.status ?? current.status,
         JSON.stringify(patch.participants ?? current.participants),
@@ -454,6 +458,47 @@ export class NectarStore {
       t1: input.t1,
       createdAt,
     }
+  }
+
+  relabelSpeakerTurns(
+    meetingId: string,
+    clusterId: string,
+    newSpeaker: string,
+  ): boolean {
+    const clean = newSpeaker.trim()
+    if (!clean) return false
+    const fallbackMatch = clusterId.match(/^speaker_(\d+)$/i)
+    const fallbackName = fallbackMatch
+      ? `Speaker ${Number(fallbackMatch[1]) + 1}`
+      : clusterId
+
+    const result = this.db
+      .prepare(
+        `UPDATE transcript_turns
+         SET speaker = ?
+         WHERE meeting_id = ?
+           AND (participant_id = ? OR speaker = ? OR speaker = ?)`,
+      )
+      .run(clean, meetingId, clusterId, clusterId, fallbackName)
+
+    if (Number(result.changes ?? 0) === 0) {
+      return false
+    }
+
+    const meeting = this.getMeeting(meetingId)
+    if (meeting) {
+      const updatedParticipants = Array.from(
+        new Set(
+          meeting.participants
+            .map((p) =>
+              p === clusterId || p === fallbackName ? clean : p,
+            )
+            .concat(clean),
+        ),
+      )
+      this.updateMeeting(meetingId, { participants: updatedParticipants })
+    }
+    return true
   }
 
   private hydrateMeeting(row: Record<string, unknown>): MeetingRecord {

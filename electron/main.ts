@@ -26,6 +26,7 @@ import {
   type LocalModelInfo,
 } from './local-models.js'
 import { MCP_TOOLS, McpHttpServer } from './mcp-server.js'
+import { StreamingSpeakerResolver } from './speaker-attribution.js'
 import {
   NectarStore,
   anyServiceUsesLocal,
@@ -74,7 +75,11 @@ let streamingWsStatus: StreamingWsStatus = {
 }
 let activeCaptureMeetingId: string | null = null
 let activeCaptureKind: 'meeting' | 'self-note' | null = null
+let activeSpeakerResolver: StreamingSpeakerResolver | null = null
+let activeRoster: string[] = []
+let detachCaptureVisualListeners: (() => void) | null = null
 let capturePaused = false
+let systemAudioBlocked = false
 let pillDragOffset: { x: number; y: number } | null = null
 let mcpServer: McpHttpServer
 let simulationTimer: NodeJS.Timeout | null = null
@@ -799,12 +804,20 @@ function getMcpInstalledState(): Record<
   }
 }
 
+async function readEffectivePermissions(prompt = false): Promise<Record<string, string>> {
+  const perms: Record<string, string> = aira
+    ? await aira.checkPermissions(prompt).catch(() => ({}))
+    : { accessibility: 'granted', microphone: 'granted', 'system-audio': 'granted' }
+  if (systemAudioBlocked) {
+    perms['system-audio'] = 'denied'
+  }
+  return perms
+}
+
 async function getFullAppState() {
   const settings = store.getSettings()
   const meetings = store.listMeetings()
-  const permissions = aira
-    ? await aira.checkPermissions(false).catch(() => ({}))
-    : { accessibility: 'granted', microphone: 'granted', 'system-audio': 'granted' }
+  const permissions = await readEffectivePermissions(false)
 
   return {
     settings,
@@ -816,6 +829,7 @@ async function getFullAppState() {
     detectedMeetings,
     activeCaptureMeetingId,
     activeCaptureKind,
+    activeRoster,
     capturePaused,
     permissions,
     meetings,
@@ -852,13 +866,21 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('nectar:checkPermissions', async (_e, prompt: boolean) => {
     if (!aira) return {}
-    const perms = await aira.checkPermissions(Boolean(prompt))
-    if (prompt && perms.accessibility !== 'granted') {
-      shell
-        .openExternal(
-          'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
-        )
-        .catch(() => {})
+    const perms = await readEffectivePermissions(Boolean(prompt))
+    if (prompt) {
+      if (perms['system-audio'] === 'denied') {
+        shell
+          .openExternal(
+            'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+          )
+          .catch(() => {})
+      } else if (perms.accessibility !== 'granted') {
+        shell
+          .openExternal(
+            'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+          )
+          .catch(() => {})
+      }
     }
     broadcast('permissions:changed', { permissions: perms })
     return perms
@@ -1044,6 +1066,10 @@ function registerIpcHandlers(): void {
     const perms = await aira.checkPermissions(true).catch(() => ({}))
     broadcast('permissions:changed', { permissions: perms })
 
+    if (detachCaptureVisualListeners) {
+      detachCaptureVisualListeners()
+      detachCaptureVisualListeners = null
+    }
     if (activeStreamingWs) {
       await activeStreamingWs.finish().catch(() => {})
       activeStreamingWs = null
@@ -1075,8 +1101,27 @@ function registerIpcHandlers(): void {
       ? store.getMeeting(opts.existingMeetingId)
       : null
 
+    const upgradeBlankNote =
+      !isSelfNote &&
+      existing &&
+      existing.platform === 'note' &&
+      existing.turns.length === 0 &&
+      resolvedTarget.platform !== 'note'
+
     const meeting = existing
-      ? store.updateMeeting(existing.id, { status: 'recording' })!
+      ? store.updateMeeting(existing.id, {
+          status: 'recording',
+          ...(upgradeBlankNote
+            ? {
+                title:
+                  existing.title === 'Untitled Meeting' && resolvedTarget.title
+                    ? resolvedTarget.title
+                    : existing.title,
+                platform: resolvedTarget.platform,
+                url: resolvedTarget.url,
+              }
+            : {}),
+        })!
       : store.createMeeting({
           title: isSelfNote
             ? 'Self Note'
@@ -1093,9 +1138,16 @@ function registerIpcHandlers(): void {
 
     activeCaptureMeetingId = meeting.id
     activeCaptureKind = opts.kind
+    activeRoster = []
     capturePaused = false
+    systemAudioBlocked = false
     const settings = store.getSettings()
     const resolved = resolveSttAndDiarize(settings)
+    const speakerResolver =
+      resolved.useStreamingWs && !isSelfNote
+        ? new StreamingSpeakerResolver()
+        : null
+    activeSpeakerResolver = speakerResolver
 
     const appendDictatedTurn = async (
       speaker: string,
@@ -1147,6 +1199,7 @@ function registerIpcHandlers(): void {
     }
 
     if (resolved.useStreamingWs) {
+      let wsRef: StreamingWsSession | null = null
       const wsSession = new StreamingWsSession(
         {
           url: settings.sttUrl,
@@ -1164,13 +1217,38 @@ function registerIpcHandlers(): void {
           onSegment: (seg) => {
             const cleanedText = cleanWhisperText(seg.text)
             if (!cleanedText) return
-            void appendDictatedTurn(
-              seg.speaker || 'speaker_0',
-              seg.speaker || null,
-              cleanedText,
-              seg.start,
-              seg.end,
-            )
+            const rawCluster = seg.speaker || 'speaker_0'
+            if (speakerResolver && wsRef) {
+              const attr = speakerResolver.resolve(
+                rawCluster,
+                seg.start,
+                seg.end,
+                wsRef.sentAudioSeconds,
+                true,
+              )
+              if (attr.relabelCluster) {
+                store.relabelSpeakerTurns(
+                  meeting.id,
+                  attr.relabelCluster.clusterId,
+                  attr.relabelCluster.speaker,
+                )
+              }
+              void appendDictatedTurn(
+                attr.speaker,
+                attr.participantId,
+                cleanedText,
+                seg.start,
+                seg.end,
+              )
+            } else {
+              void appendDictatedTurn(
+                rawCluster,
+                rawCluster,
+                cleanedText,
+                seg.start,
+                seg.end,
+              )
+            }
           },
           onPartial: (partial) => {
             if (!partial) {
@@ -1179,9 +1257,22 @@ function registerIpcHandlers(): void {
             }
             const cleanedText = cleanWhisperText(partial.text)
             if (cleanedText) {
+              const rawCluster = partial.speaker || 'speaker_0'
+              const resolvedName =
+                isSelfNote
+                  ? 'You'
+                  : speakerResolver && wsRef
+                    ? speakerResolver.resolve(
+                        rawCluster,
+                        partial.start,
+                        partial.end,
+                        wsRef.sentAudioSeconds,
+                        false,
+                      ).speaker
+                    : rawCluster
               broadcast('meeting:partial', {
                 meetingId: meeting.id,
-                speaker: isSelfNote ? 'You' : partial.speaker || 'speaker_0',
+                speaker: resolvedName,
                 text: cleanedText,
                 t0: partial.start,
               })
@@ -1189,6 +1280,7 @@ function registerIpcHandlers(): void {
           },
         },
       )
+      wsRef = wsSession
       activeStreamingWs = wsSession
       wsSession.start()
     }
@@ -1199,14 +1291,52 @@ function registerIpcHandlers(): void {
     })
     activeCaptureSession = session
 
+    let hasNonZeroSysAudio = false
+    let zeroSysChunks = 0
+
     session.on(
       'audio',
-      (chunk: { pcm?: Buffer; sysRMS?: number; micRMS?: number }) => {
+      (chunk: {
+        pcm?: Buffer
+        sysRMS?: number
+        micRMS?: number
+        micActive?: boolean
+      }) => {
         if (!capturePaused) {
-          const level = isSelfNote
-            ? chunk.micRMS ?? 0
-            : Math.max(chunk.sysRMS ?? 0, chunk.micRMS ?? 0)
+          const sysRMS = chunk.sysRMS ?? 0
+          const micRMS = chunk.micRMS ?? 0
+          const level = isSelfNote ? micRMS : Math.max(sysRMS, micRMS)
           broadcast('audio:level', { level })
+
+          if (!isSelfNote) {
+            if (sysRMS > 0) {
+              hasNonZeroSysAudio = true
+              if (systemAudioBlocked) {
+                systemAudioBlocked = false
+                void readEffectivePermissions(false).then((p) =>
+                  broadcast('permissions:changed', { permissions: p }),
+                )
+              }
+            } else if (!hasNonZeroSysAudio) {
+              zeroSysChunks += 1
+              if (zeroSysChunks === 50 && !systemAudioBlocked) {
+                systemAudioBlocked = true
+                void readEffectivePermissions(false).then((p) =>
+                  broadcast('permissions:changed', { permissions: p }),
+                )
+              }
+            }
+          }
+
+          if (speakerResolver && activeStreamingWs) {
+            speakerResolver.recordAudio(
+              activeStreamingWs.sentAudioSeconds,
+              sysRMS,
+              micRMS,
+              Boolean(chunk.micActive),
+            )
+          }
+
           if (activeStreamingWs && chunk.pcm && chunk.pcm.length > 0) {
             activeStreamingWs.feedPcm(chunk.pcm)
           }
@@ -1214,32 +1344,84 @@ function registerIpcHandlers(): void {
       },
     )
 
-    if (!resolved.useStreamingWs) {
-      ;(async () => {
-        for await (const ev of session.events) {
-          if (capturePaused) continue
-          if (ev.type === 'transcript') {
-            const cleanedText = cleanWhisperText(ev.text)
-            if (!ev.partial && cleanedText) {
-              await appendDictatedTurn(
-                ev.name || 'You',
-                ev.participantId ?? null,
-                cleanedText,
-                ev.t0,
-                ev.t1,
-              )
-            } else if (ev.partial && cleanedText) {
-              broadcast('meeting:partial', {
-                meetingId: meeting.id,
-                speaker: isSelfNote ? 'You' : ev.name || 'You',
-                text: cleanedText,
-                t0: ev.t0,
-              })
-            }
+    if (speakerResolver && activeStreamingWs) {
+      const captureBridge = aira.capture
+      const onRoster = (payload: {
+        participants?: { id: string; name: string }[]
+        localUserName?: string
+      }) => {
+        const list = payload.participants ?? []
+        speakerResolver.recordRoster(list, payload.localUserName)
+        const names = new Set<string>(activeRoster)
+        for (const p of list) {
+          const n = p.name?.trim()
+          if (n) names.add(n)
+        }
+        const local = payload.localUserName?.trim()
+        if (local && local.toLowerCase() !== 'you') {
+          names.add(local)
+        }
+        const sorted = Array.from(names).sort((a, b) => a.localeCompare(b))
+        if (JSON.stringify(sorted) !== JSON.stringify(activeRoster)) {
+          activeRoster = sorted
+          broadcast('meeting:roster', { activeRoster })
+        }
+      }
+      const onSpeaker = (payload: {
+        participantId?: string
+        name?: string
+        source?: string
+      }) => {
+        if (!capturePaused && activeStreamingWs && payload.name) {
+          speakerResolver.recordSpeakerChange(
+            payload.participantId ?? payload.name,
+            payload.name,
+            activeStreamingWs.sentAudioSeconds,
+            payload.source,
+          )
+        }
+      }
+      captureBridge.on('roster', onRoster)
+      captureBridge.on('speaker_activity', onSpeaker)
+      captureBridge.on('speaker_change', onSpeaker)
+      detachCaptureVisualListeners = () => {
+        captureBridge.off('roster', onRoster)
+        captureBridge.off('speaker_activity', onSpeaker)
+        captureBridge.off('speaker_change', onSpeaker)
+      }
+    }
+
+    ;(async () => {
+      for await (const ev of session.events) {
+        if (ev.type === 'roster' && speakerResolver) {
+          speakerResolver.recordRoster(ev.participants)
+        } else if (ev.type === 'speaker_change' && speakerResolver && activeStreamingWs) {
+          speakerResolver.recordSpeakerChange(
+            ev.participantId,
+            ev.name,
+            activeStreamingWs.sentAudioSeconds,
+          )
+        } else if (!resolved.useStreamingWs && !capturePaused && ev.type === 'transcript') {
+          const cleanedText = cleanWhisperText(ev.text)
+          if (!ev.partial && cleanedText) {
+            await appendDictatedTurn(
+              ev.name || 'You',
+              ev.participantId ?? null,
+              cleanedText,
+              ev.t0,
+              ev.t1,
+            )
+          } else if (ev.partial && cleanedText) {
+            broadcast('meeting:partial', {
+              meetingId: meeting.id,
+              speaker: isSelfNote ? 'You' : ev.name || 'You',
+              text: cleanedText,
+              t0: ev.t0,
+            })
           }
         }
-      })().catch(() => {})
-    }
+      }
+    })().catch(() => {})
 
     broadcast('state:refresh', await getFullAppState())
     return meeting
@@ -1312,10 +1494,28 @@ function registerIpcHandlers(): void {
     }
   })
 
+  ipcMain.handle(
+    'nectar:relabelSpeaker',
+    async (_e, meetingId: string, clusterId: string, newSpeaker: string) => {
+      const clean = newSpeaker.trim()
+      if (!clean) return store.getMeeting(meetingId)
+      store.relabelSpeakerTurns(meetingId, clusterId, clean)
+      if (meetingId === activeCaptureMeetingId && activeSpeakerResolver) {
+        activeSpeakerResolver.lockCluster(clusterId, clean)
+      }
+      broadcast('state:refresh', await getFullAppState())
+      return store.getMeeting(meetingId)
+    },
+  )
+
   ipcMain.handle('nectar:stopCapture', async () => {
     if (simulationTimer) {
       clearInterval(simulationTimer)
       simulationTimer = null
+    }
+    if (detachCaptureVisualListeners) {
+      detachCaptureVisualListeners()
+      detachCaptureVisualListeners = null
     }
     if (activeStreamingWs) {
       await activeStreamingWs.finish().catch(() => {})
@@ -1335,7 +1535,10 @@ function registerIpcHandlers(): void {
     const stoppedMeetingId = activeCaptureMeetingId
     activeCaptureMeetingId = null
     activeCaptureKind = null
+    activeSpeakerResolver = null
+    activeRoster = []
     capturePaused = false
+    systemAudioBlocked = false
     broadcast('audio:level', { level: 0 })
     if (stoppedMeetingId) {
       store.updateMeeting(stoppedMeetingId, {

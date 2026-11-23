@@ -61,6 +61,7 @@ export class StreamingWsSession {
   private open = false
   private paused = false
   private lastFrameSentAt = 0
+  private sentAudioBytes = 0
   private silenceTimer: NodeJS.Timeout | null = null
   private pcmRemainder: Buffer = Buffer.alloc(0)
   private pendingFrames: Buffer[] = []
@@ -74,6 +75,10 @@ export class StreamingWsSession {
     private readonly config: StreamingWsConfig,
     private readonly callbacks: StreamingWsCallbacks,
   ) {}
+
+  get sentAudioSeconds(): number {
+    return this.sentAudioBytes / 32000
+  }
 
   start(): void {
     if (this.ws || this.closed) return
@@ -261,6 +266,7 @@ export class StreamingWsSession {
       }
       if (Date.now() - this.lastFrameSentAt >= SILENCE_GAP_MS) {
         this.lastFrameSentAt = Date.now()
+        this.sentAudioBytes += FRAME_BYTES
         this.ws.send(
           JSON.stringify({
             type: 'input_audio_buffer.append',
@@ -281,6 +287,7 @@ export class StreamingWsSession {
   private sendOrQueueFrame(frame: Buffer): void {
     if (this.open && this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.lastFrameSentAt = Date.now()
+      this.sentAudioBytes += frame.length
       this.ws.send(
         JSON.stringify({
           type: 'input_audio_buffer.append',
@@ -303,6 +310,7 @@ export class StreamingWsSession {
       const frame = this.pendingFrames.shift()!
       this.pendingBytes -= frame.length
       this.lastFrameSentAt = Date.now()
+      this.sentAudioBytes += frame.length
       this.ws.send(
         JSON.stringify({
           type: 'input_audio_buffer.append',

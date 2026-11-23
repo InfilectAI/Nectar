@@ -161,6 +161,7 @@ export interface AppState {
   detectedMeetings: MeetingTarget[]
   activeCaptureMeetingId: string | null
   activeCaptureKind: 'meeting' | 'self-note' | null
+  activeRoster?: string[]
   capturePaused: boolean
   permissions: Record<string, string>
   meetings: MeetingRecord[]
@@ -211,6 +212,11 @@ declare global {
       updateMeeting(id: string, patch: Partial<MeetingRecord>): Promise<MeetingRecord>
       deleteMeeting(id: string): Promise<{ ok: boolean }>
       distillMeeting(id: string): Promise<MeetingRecord>
+      relabelSpeaker(
+        meetingId: string,
+        clusterId: string,
+        newSpeaker: string,
+      ): Promise<MeetingRecord | null>
       startCapture(target?: MeetingTarget, meetingId?: string): Promise<MeetingRecord>
       startSelfNote(meetingId?: string): Promise<MeetingRecord>
       pauseCapture(): Promise<AppState>
