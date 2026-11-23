@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld('nectar', {
   updateMeeting: (id, patch) => ipcRenderer.invoke('nectar:updateMeeting', id, patch),
   deleteMeeting: (id) => ipcRenderer.invoke('nectar:deleteMeeting', id),
   distillMeeting: (id) => ipcRenderer.invoke('nectar:distillMeeting', id),
+  relabelSpeaker: (meetingId, clusterId, newSpeaker) =>
+    ipcRenderer.invoke('nectar:relabelSpeaker', meetingId, clusterId, newSpeaker),
 
   // Live Capture & Simulation
   startCapture: (target, meetingId) =>

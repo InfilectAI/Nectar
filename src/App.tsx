@@ -102,6 +102,8 @@ export default function App() {
     Partial<Record<CloudServiceKey, ServiceValidationResult>>
   >({})
   const [settingsValidationFailed, setSettingsValidationFailed] = useState(false)
+  const [editingTurnId, setEditingTurnId] = useState<string | null>(null)
+  const [customSpeakerInput, setCustomSpeakerInput] = useState('')
 
   const isPillOverlay =
     typeof window !== 'undefined' && window.location.search.includes('view=pill')
@@ -167,6 +169,9 @@ export default function App() {
       } else if (ev.type === 'streaming:status') {
         const streamingWs = ev.streamingWs as StreamingWsStatus
         setState((prev) => (prev ? { ...prev, streamingWs } : prev))
+      } else if (ev.type === 'meeting:roster') {
+        const activeRoster = (ev.activeRoster as string[]) ?? []
+        setState((prev) => (prev ? { ...prev, activeRoster } : prev))
       } else if (ev.type === 'meeting:partial') {
         const text = String(ev.text ?? '').trim()
         if (!text) {
@@ -437,13 +442,21 @@ export default function App() {
   const streamingWs = state.streamingWs
 
   const speakerColorClass = (speaker: string) => {
-    if (speaker.endsWith('_1') || speaker === 'Priya' || speaker === 'Daniel') {
-      return 'text-emerald-700'
+    const palette = [
+      'text-signal',
+      'text-emerald-700',
+      'text-amber',
+      'text-sky-700',
+    ]
+    const clusterMatch = speaker.match(/(\d+)$/)
+    if (clusterMatch) {
+      return palette[Number(clusterMatch[1]) % palette.length]!
     }
-    if (speaker.endsWith('_2') || speaker === 'Alex') {
-      return 'text-amber'
+    let h = 0
+    for (let i = 0; i < speaker.length; i += 1) {
+      h = (h * 31 + speaker.charCodeAt(i)) >>> 0
     }
-    return 'text-signal'
+    return palette[h % palette.length]!
   }
 
   return (
@@ -460,12 +473,18 @@ export default function App() {
         {/* Center Live Call / Permission / Model Download & Streaming WS Banner */}
         <div className="app-no-drag flex items-center gap-2">
           {(state.permissions?.accessibility === 'denied' ||
-            state.permissions?.microphone === 'denied') && (
+            state.permissions?.microphone === 'denied' ||
+            state.permissions?.['system-audio'] === 'denied') && (
             <div className="flex items-center gap-2 rounded-[4px] border border-amber bg-amber-tint px-2.5 py-0.5">
               <span className="font-mono text-[10.5px] font-medium text-ink">
                 Permissions needed:{' '}
-                {state.permissions?.accessibility === 'denied' ? 'Accessibility ' : ''}
-                {state.permissions?.microphone === 'denied' ? 'Microphone' : ''}
+                {[
+                  state.permissions?.['system-audio'] === 'denied' ? 'System Audio' : '',
+                  state.permissions?.accessibility === 'denied' ? 'Accessibility' : '',
+                  state.permissions?.microphone === 'denied' ? 'Microphone' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
               </span>
               <button
                 onClick={async () => {
@@ -935,24 +954,110 @@ export default function App() {
                   </div>
 
                   <div className="flex-1 overflow-y-auto p-3.5 space-y-2.5">
-                    {selectedMeeting.turns.map((turn) => (
-                      <div
-                        key={turn.id}
-                        className="rounded-[4px] border border-rail bg-well p-3"
-                      >
-                        <div className="flex items-center justify-between font-mono text-[10.5px]">
-                          <span
-                            className={`font-semibold ${speakerColorClass(turn.speaker)}`}
+                    {(() => {
+                      const rosterChoices = Array.from(
+                        new Set([
+                          ...(isRecordingThisMeeting ? state.activeRoster ?? [] : []),
+                          ...selectedMeeting.participants.filter(
+                            (p) => !/^(?:speaker[_ ]\d+|speaker)$/i.test(p.trim()),
+                          ),
+                        ]),
+                      )
+                      return selectedMeeting.turns.map((turn) => {
+                        const isEditing = editingTurnId === turn.id
+                        const clusterKey = turn.participantId || turn.speaker
+                        const assignSpeaker = async (name: string) => {
+                          const clean = name.trim()
+                          if (!clean) return
+                          await window.nectar.relabelSpeaker(
+                            selectedMeeting.id,
+                            clusterKey,
+                            clean,
+                          )
+                          setEditingTurnId(null)
+                          setCustomSpeakerInput('')
+                        }
+                        return (
+                          <div
+                            key={turn.id}
+                            className="rounded-[4px] border border-rail bg-well p-3"
                           >
-                            {turn.speaker}
-                          </span>
-                          <span className="text-dim">{formatTimecode(turn.t0)}</span>
-                        </div>
-                        <p className="mt-1 text-[13px] leading-relaxed text-ink">
-                          {turn.text}
-                        </p>
-                      </div>
-                    ))}
+                            <div className="flex items-center justify-between font-mono text-[10.5px]">
+                              <button
+                                type="button"
+                                title="Click to assign speaker name for all turns from this voice"
+                                onClick={() => {
+                                  if (isEditing) {
+                                    setEditingTurnId(null)
+                                  } else {
+                                    setEditingTurnId(turn.id)
+                                    setCustomSpeakerInput(
+                                      /^(?:speaker[_ ]\d+|speaker)$/i.test(
+                                        turn.speaker.trim(),
+                                      )
+                                        ? ''
+                                        : turn.speaker,
+                                    )
+                                  }
+                                }}
+                                className={`inline-flex items-center gap-1 rounded-[3px] px-1 -ml-1 hover:bg-strip font-semibold ${speakerColorClass(turn.speaker)}`}
+                              >
+                                <span>{turn.speaker}</span>
+                                <span className="text-[9px] text-dim font-normal">▾</span>
+                              </button>
+                              <span className="text-dim">{formatTimecode(turn.t0)}</span>
+                            </div>
+
+                            {isEditing && (
+                              <div className="mt-2 rounded-[4px] border border-rail bg-chassis p-2 space-y-1.5">
+                                {rosterChoices.length > 0 && (
+                                  <div className="flex flex-wrap gap-1">
+                                    {rosterChoices.map((name) => (
+                                      <button
+                                        key={name}
+                                        type="button"
+                                        onClick={() => void assignSpeaker(name)}
+                                        className="rounded-[3px] border border-rail bg-well px-2 py-0.5 font-mono text-[10px] font-medium text-ink hover:border-signal hover:text-signal"
+                                      >
+                                        {name}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                                <form
+                                  onSubmit={(e) => {
+                                    e.preventDefault()
+                                    void assignSpeaker(customSpeakerInput)
+                                  }}
+                                  className="flex items-center gap-1"
+                                >
+                                  <input
+                                    type="text"
+                                    autoFocus
+                                    value={customSpeakerInput}
+                                    onChange={(e) =>
+                                      setCustomSpeakerInput(e.target.value)
+                                    }
+                                    placeholder="Assign speaker name…"
+                                    className="flex-1 min-w-0 rounded-[3px] border border-rail bg-well px-2 py-0.5 text-[11px] text-ink placeholder:text-dim focus:border-ink/40 focus:outline-none"
+                                  />
+                                  <button
+                                    type="submit"
+                                    className="rounded-[3px] bg-ink px-2 py-0.5 font-mono text-[10px] font-semibold text-well hover:bg-signal-bright"
+                                  >
+                                    Set
+                                  </button>
+                                </form>
+                              </div>
+                            )}
+
+                            <p className="mt-1 text-[13px] leading-relaxed text-ink">
+                              {turn.text}
+                            </p>
+                          </div>
+                        )
+                      })
+                    })()}
 
                     {livePartial && (
                       <div className="rounded-[4px] border border-dashed border-signal bg-signal-tint p-3">
@@ -1052,6 +1157,33 @@ export default function App() {
                               className="rounded-[3px] bg-ink px-2.5 py-1 text-[10.5px] font-semibold text-well"
                             >
                               Check STT Settings
+                            </button>
+                          </div>
+                        ) : isRecordingThisMeeting &&
+                          state.permissions?.['system-audio'] === 'denied' ? (
+                          <div className="rounded-[4px] border border-amber bg-amber-tint p-3 font-mono text-[11px] text-ink space-y-2 text-left">
+                            <div className="font-semibold text-amber">
+                              No system audio detected
+                            </div>
+                            <div className="text-[10.5px] text-muted leading-relaxed">
+                              macOS muted meeting audio. Add Nectar under{' '}
+                              <strong className="text-ink">
+                                Privacy &amp; Security → Screen &amp; System Audio
+                                Recording → System Audio Recording Only
+                              </strong>
+                              , then restart Nectar.
+                            </div>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const perms = await window.nectar.checkPermissions(true)
+                                setState((prev) =>
+                                  prev ? { ...prev, permissions: perms } : prev,
+                                )
+                              }}
+                              className="rounded-[3px] bg-ink px-2.5 py-1 text-[10.5px] font-semibold text-well hover:bg-signal-bright"
+                            >
+                              Open System Settings
                             </button>
                           </div>
                         ) : isRecordingThisMeeting ? (

@@ -25,6 +25,10 @@ import {
   anyServiceUsesLocal,
   normalizeSettings,
 } from '../dist-electron/store.js'
+import {
+  StreamingSpeakerResolver,
+  formatClusterFallback,
+} from '../dist-electron/speaker-attribution.js'
 import { StreamingWsSession } from '../dist-electron/streaming-ws.js'
 
 const tempDirs = []
@@ -336,6 +340,76 @@ describe('StreamingWsSession', () => {
       await session.finish(1000)
     } finally {
       wss.close()
+    }
+  })
+})
+
+describe('StreamingSpeakerResolver & retroactive relabeling', () => {
+  it('maps diarizer cluster IDs to visual speaker names and local mic user', () => {
+    const resolver = new StreamingSpeakerResolver()
+    resolver.recordRoster([
+      { id: 'Sean Bangalore', name: 'Sean Bangalore' },
+      { id: 'Jimmy Whitaker', name: 'Jimmy Whitaker' },
+      { id: 'Abhi Jain', name: 'Abhi Jain' },
+    ], 'Abhi Jain')
+
+    // Turn 1 arrives before any visual speaker_change -> friendly fallback, keeps clusterId
+    const initial = resolver.resolve('speaker_0', 0.0, 2.0, 2.5, true)
+    assert.equal(initial.speaker, 'Speaker 1')
+    assert.equal(initial.participantId, 'speaker_0')
+    assert.equal(formatClusterFallback('speaker_1'), 'Speaker 2')
+
+    // Visual scraper identifies Sean Bangalore speaking at t=2.5s
+    resolver.recordSpeakerChange('Sean Bangalore', 'Sean Bangalore', 2.5, 'native_ax')
+    // A brief local mic blip must not close Sean Bangalore's ongoing visual span
+    resolver.recordSpeakerChange('local', 'You', 4.0, 'mic')
+    const matched = resolver.resolve('speaker_0', 3.0, 7.0, 7.5, true)
+    assert.equal(matched.speaker, 'Sean Bangalore')
+    assert.deepEqual(matched.relabelCluster, {
+      clusterId: 'speaker_0',
+      speaker: 'Sean Bangalore',
+      participantId: 'speaker_0',
+    })
+
+    // Local mic dominates for speaker_1 -> mapped to Abhi Jain
+    for (let t = 8.0; t <= 10.0; t += 0.2) {
+      resolver.recordAudio(t, 0.002, 0.06, true)
+    }
+    const localTurn = resolver.resolve('speaker_1', 8.0, 10.0, 10.5, true)
+    assert.equal(localTurn.speaker, 'Abhi Jain')
+
+    // Manual 1-click cluster lock overrides future visual speaker changes
+    resolver.lockCluster('speaker_2', 'Ben Levitt')
+    resolver.recordSpeakerChange('Jimmy Whitaker', 'Jimmy Whitaker', 12.0, 'native_ax')
+    const locked = resolver.resolve('speaker_2', 12.2, 15.0, 15.5, true)
+    assert.equal(locked.speaker, 'Ben Levitt')
+  })
+
+  it('relabels earlier generic turns and participants in SQLite once cluster name resolves', () => {
+    const dir = makeTempDir()
+    const store = new NectarStore(path.join(dir, 'nectar.db'))
+    try {
+      const m = store.createMeeting({
+        title: 'FDE Weekly Sync',
+        platform: 'zoom',
+        url: 'zoom://meeting/1',
+      })
+      store.addTranscriptTurn({
+        meetingId: m.id,
+        speaker: 'Speaker 1',
+        participantId: 'speaker_0',
+        text: 'First sentence before AX scrape',
+        t0: 0,
+        t1: 3,
+      })
+      const changed = store.relabelSpeakerTurns(m.id, 'speaker_0', 'Sean Bangalore')
+      assert.equal(changed, true)
+
+      const updated = store.getMeeting(m.id)
+      assert.equal(updated.turns[0].speaker, 'Sean Bangalore')
+      assert.deepEqual(updated.participants, ['Sean Bangalore'])
+    } finally {
+      store.close()
     }
   })
 })

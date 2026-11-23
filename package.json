@@ -27,7 +27,7 @@
     "url": "https://github.com/InfilectAI/Nectar/issues"
   },
   "dependencies": {
-    "@infilectai/aira": "0.2.2",
+    "@infilectai/aira": "0.2.3",
     "@infilectai/cortex": "^0.2.0",
     "@infilectai/synapse": "^0.1.1",
     "lucide-react": "^0.468.0",
@@ -79,6 +79,7 @@
       ],
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Nectar uses the microphone to capture and attribute your voice during meetings.",
+        "NSAudioCaptureUsageDescription": "Nectar captures meeting system audio to transcribe and attribute speakers without Screen Recording.",
         "NSAccessibilityUsageDescription": "Nectar uses Accessibility to detect active meeting windows and participants.",
         "NSAppleEventsUsageDescription": "Nectar uses Apple Events to inspect active meeting tabs when permitted."
       }
