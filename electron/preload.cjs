@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('nectar', {
   focusMainWindow: () => ipcRenderer.invoke('nectar:focusMainWindow'),
   startPillDrag: () => ipcRenderer.send('nectar:startPillDrag'),
   dragPill: () => ipcRenderer.send('nectar:dragPill'),
+  setPillExpanded: (expanded) => ipcRenderer.invoke('nectar:setPillExpanded', expanded),
 
   // MCP
   installMcp: (target) => ipcRenderer.invoke('nectar:installMcp', target),

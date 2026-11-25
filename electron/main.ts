@@ -75,14 +75,34 @@ let streamingWsStatus: StreamingWsStatus = {
 }
 let activeCaptureMeetingId: string | null = null
 let activeCaptureKind: 'meeting' | 'self-note' | null = null
+let activeCaptureTarget: MeetingTarget | null = null
+let activeCaptureSawMeeting = false
+let meetingEndedPrompt: { title: string; platform: string } | null = null
+let meetingEndDebounceTimer: NodeJS.Timeout | null = null
 let activeSpeakerResolver: StreamingSpeakerResolver | null = null
 let activeRoster: string[] = []
 let detachCaptureVisualListeners: (() => void) | null = null
 let capturePaused = false
 let systemAudioBlocked = false
 let pillDragOffset: { x: number; y: number } | null = null
+const PILL_COLLAPSED_WIDTH = 40
+const PILL_EXPANDED_WIDTH = 276
+let pillExpanded = false
+let pillExpandedSide: 'left' | 'right' = 'left'
 let mcpServer: McpHttpServer
 let simulationTimer: NodeJS.Timeout | null = null
+
+function clearMeetingEndDebounce(): void {
+  if (meetingEndDebounceTimer) {
+    clearTimeout(meetingEndDebounceTimer)
+    meetingEndDebounceTimer = null
+  }
+}
+
+function sameMeetingTarget(a: MeetingTarget, b: MeetingTarget): boolean {
+  if (a.url && b.url && a.url === b.url) return true
+  return a.platform === b.platform && a.pid === b.pid && a.pid > 0
+}
 
 function unpackPath(p: string): string {
   return p.includes('app.asar') && !p.includes('app.asar.unpacked')
@@ -628,8 +648,72 @@ async function initComputeAndPerception(settings: NectarSettings): Promise<void>
 
     watcher = aira.eyes.watchMeetings()
     watcher.on('meetings', (meetings: MeetingTarget[]) => {
+      const prevMeetings = detectedMeetings
       detectedMeetings = meetings
       broadcast('meetings:detected', { detectedMeetings })
+
+      if (activeCaptureMeetingId && activeCaptureKind === 'meeting' && activeCaptureTarget) {
+        const target = activeCaptureTarget
+        const stillLive = meetings.some((m) => sameMeetingTarget(m, target))
+        if (stillLive) {
+          activeCaptureSawMeeting = true
+          clearMeetingEndDebounce()
+          if (meetingEndedPrompt) {
+            meetingEndedPrompt = null
+            broadcast('meeting:lifecycle', { kind: 'resumed' })
+          }
+        } else if (activeCaptureSawMeeting && !meetingEndedPrompt && !meetingEndDebounceTimer) {
+          const endedTitle = target.title || 'Meeting'
+          const endedPlatform = target.platform || 'meeting'
+          meetingEndDebounceTimer = setTimeout(() => {
+            meetingEndDebounceTimer = null
+            if (
+              !activeCaptureMeetingId ||
+              activeCaptureKind !== 'meeting' ||
+              !activeCaptureTarget
+            ) {
+              return
+            }
+            const presentNow = detectedMeetings.some((m) =>
+              sameMeetingTarget(m, activeCaptureTarget!),
+            )
+            if (!presentNow) {
+              meetingEndedPrompt = { title: endedTitle, platform: endedPlatform }
+              broadcast('meeting:lifecycle', {
+                kind: 'ended',
+                title: endedTitle,
+                platform: endedPlatform,
+                isRecording: true,
+              })
+            }
+          }, 2500)
+        }
+      } else if (!activeCaptureMeetingId) {
+        const newlyStarted = meetings.filter(
+          (m) => !prevMeetings.some((p) => sameMeetingTarget(p, m)),
+        )
+        const justEnded = prevMeetings.filter(
+          (p) => !meetings.some((m) => sameMeetingTarget(p, m)),
+        )
+        if (newlyStarted.length > 0) {
+          const started = newlyStarted[0]!
+          broadcast('meeting:lifecycle', {
+            kind: 'started',
+            target: started,
+            title: started.title || 'Live Meeting',
+            platform: started.platform || 'meeting',
+            isRecording: false,
+          })
+        } else if (justEnded.length > 0 && meetings.length === 0) {
+          const ended = justEnded[0]!
+          broadcast('meeting:lifecycle', {
+            kind: 'ended',
+            title: ended.title || 'Meeting',
+            platform: ended.platform || 'meeting',
+            isRecording: false,
+          })
+        }
+      }
     })
   }
 
@@ -830,6 +914,7 @@ async function getFullAppState() {
     activeCaptureMeetingId,
     activeCaptureKind,
     activeRoster,
+    meetingEndedPrompt,
     capturePaused,
     permissions,
     meetings,
@@ -1018,43 +1103,62 @@ function registerIpcHandlers(): void {
     return { ok: true }
   })
 
-  ipcMain.handle('nectar:distillMeeting', async (_e, id: string) => {
+  const distillingMeetingIds = new Set<string>()
+
+  const runDistillMeeting = async (id: string): Promise<MeetingRecord> => {
     const meeting = store.getMeeting(id)
     if (!meeting) throw new Error(`Meeting ${id} not found`)
-    const settings = store.getSettings()
-    const result = await distillMeeting(meeting, settings, cortexUrl)
-    const updated = store.updateMeeting(id, {
-      status: 'completed',
-      endedAt: meeting.endedAt ?? new Date().toISOString(),
-      distilledNotes: result.distilledNotes,
-      actionItems: result.actionItems,
-      decisions: result.decisions,
-    })!
+    if (distillingMeetingIds.has(id)) {
+      return meeting
+    }
+    distillingMeetingIds.add(id)
+    broadcast('meeting:distilling', { meetingId: id, distilling: true })
+    try {
+      const settings = store.getSettings()
+      const result = await distillMeeting(meeting, settings, cortexUrl)
+      const latest = store.getMeeting(id) ?? meeting
+      const updated = store.updateMeeting(id, {
+        status: 'completed',
+        endedAt: latest.endedAt ?? new Date().toISOString(),
+        distilledNotes: result.distilledNotes,
+        actionItems: result.actionItems,
+        decisions: result.decisions,
+      })!
 
-    const transcriptContent =
-      updated.turns.length > 0
-        ? updated.turns.map((t) => `${t.speaker}: ${t.text}`).join('\n')
-        : updated.roughNotes || updated.title
+      const transcriptContent =
+        updated.turns.length > 0
+          ? updated.turns.map((t) => `${t.speaker}: ${t.text}`).join('\n')
+          : updated.roughNotes || updated.title
 
-    await synapse.ingest(
-      new SourceEvent({
-        sourceId: `meeting-${updated.id}`,
-        sourceType: SourceType.MEETING,
-        conversationId: updated.id,
-        content: transcriptContent,
-        participants:
-          updated.participants.length > 0 ? updated.participants : ['You'],
-        occurredAt: new Date(updated.startedAt),
-        metadata: {
-          title: updated.title,
-          semantic_assertions: result.assertions,
-        },
-      }),
-      settings.groupId,
-    )
-    await synapse.consolidate(settings.groupId)
-    broadcast('state:refresh', await getFullAppState())
-    return updated
+      await synapse
+        .ingest(
+          new SourceEvent({
+            sourceId: `meeting-${updated.id}`,
+            sourceType: SourceType.MEETING,
+            conversationId: updated.id,
+            content: transcriptContent,
+            participants:
+              updated.participants.length > 0 ? updated.participants : ['You'],
+            occurredAt: new Date(updated.startedAt),
+            metadata: {
+              title: updated.title,
+              semantic_assertions: result.assertions,
+            },
+          }),
+          settings.groupId,
+        )
+        .catch(() => {})
+      await synapse.consolidate(settings.groupId).catch(() => {})
+      broadcast('state:refresh', await getFullAppState())
+      return updated
+    } finally {
+      distillingMeetingIds.delete(id)
+      broadcast('meeting:distilling', { meetingId: id, distilling: false })
+    }
+  }
+
+  ipcMain.handle('nectar:distillMeeting', async (_e, id: string) => {
+    return runDistillMeeting(id)
   })
 
   const beginCapture = async (opts: {
@@ -1097,9 +1201,21 @@ function registerIpcHandlers(): void {
           title: 'Live Meeting Capture',
         }
 
-    const existing = opts.existingMeetingId
+    const requestedExisting = opts.existingMeetingId
       ? store.getMeeting(opts.existingMeetingId)
       : null
+
+    // For meeting capture, NEVER append to an already-recorded or completed meeting;
+    // only reuse an untouched blank scratchpad note, otherwise auto-create a fresh meeting.
+    const existing =
+      isSelfNote
+        ? requestedExisting
+        : requestedExisting &&
+            requestedExisting.platform === 'note' &&
+            requestedExisting.turns.length === 0 &&
+            !requestedExisting.distilledNotes.trim()
+          ? requestedExisting
+          : null
 
     const upgradeBlankNote =
       !isSelfNote &&
@@ -1138,6 +1254,11 @@ function registerIpcHandlers(): void {
 
     activeCaptureMeetingId = meeting.id
     activeCaptureKind = opts.kind
+    clearMeetingEndDebounce()
+    meetingEndedPrompt = null
+    activeCaptureTarget = !isSelfNote ? resolvedTarget : null
+    activeCaptureSawMeeting =
+      !isSelfNote && detectedMeetings.some((m) => sameMeetingTarget(m, resolvedTarget))
     activeRoster = []
     capturePaused = false
     systemAudioBlocked = false
@@ -1424,6 +1545,7 @@ function registerIpcHandlers(): void {
     })().catch(() => {})
 
     broadcast('state:refresh', await getFullAppState())
+    broadcast('meeting:started', { meetingId: meeting.id, kind: opts.kind })
     return meeting
   }
 
@@ -1494,6 +1616,45 @@ function registerIpcHandlers(): void {
     }
   })
 
+  ipcMain.handle('nectar:setPillExpanded', (_e, expanded: boolean) => {
+    if (!pillWindow || pillWindow.isDestroyed()) {
+      return { side: pillExpandedSide }
+    }
+    const want = Boolean(expanded)
+    if (want === pillExpanded) {
+      return { side: pillExpandedSide }
+    }
+    const bounds = pillWindow.getBounds()
+    const delta = PILL_EXPANDED_WIDTH - PILL_COLLAPSED_WIDTH
+    const display = screen.getDisplayNearestPoint({
+      x: bounds.x + Math.round(bounds.width / 2),
+      y: bounds.y + Math.round(bounds.height / 2),
+    })
+
+    let nextX = bounds.x
+    let nextWidth = PILL_COLLAPSED_WIDTH
+
+    if (want) {
+      const canExpandLeft = bounds.x - delta >= display.workArea.x + 6
+      pillExpandedSide = canExpandLeft ? 'left' : 'right'
+      nextX = canExpandLeft ? bounds.x - delta : bounds.x
+      nextWidth = PILL_EXPANDED_WIDTH
+    } else {
+      nextX = pillExpandedSide === 'left' ? bounds.x + delta : bounds.x
+      nextWidth = PILL_COLLAPSED_WIDTH
+    }
+
+    const clamped = clampPillBounds(nextX, bounds.y, nextWidth, bounds.height)
+    pillWindow.setResizable(true)
+    pillWindow.setBounds(
+      { x: clamped.x, y: clamped.y, width: nextWidth, height: bounds.height },
+      false,
+    )
+    pillWindow.setResizable(false)
+    pillExpanded = want
+    return { side: pillExpandedSide }
+  })
+
   ipcMain.handle(
     'nectar:relabelSpeaker',
     async (_e, meetingId: string, clusterId: string, newSpeaker: string) => {
@@ -1535,6 +1696,10 @@ function registerIpcHandlers(): void {
     const stoppedMeetingId = activeCaptureMeetingId
     activeCaptureMeetingId = null
     activeCaptureKind = null
+    activeCaptureTarget = null
+    activeCaptureSawMeeting = false
+    clearMeetingEndDebounce()
+    meetingEndedPrompt = null
     activeSpeakerResolver = null
     activeRoster = []
     capturePaused = false
@@ -1548,6 +1713,15 @@ function registerIpcHandlers(): void {
     }
     const state = await getFullAppState()
     broadcast('state:refresh', state)
+    if (stoppedMeetingId) {
+      const finished = store.getMeeting(stoppedMeetingId)
+      if (
+        finished &&
+        (finished.turns.length > 0 || finished.roughNotes.trim().length > 0)
+      ) {
+        void runDistillMeeting(stoppedMeetingId).catch(() => {})
+      }
+    }
     return state
   })
 
@@ -1875,9 +2049,11 @@ function clampPillBounds(
 async function createPillWindow(): Promise<void> {
   const display = screen.getPrimaryDisplay()
   const db = display.bounds
-  const pillWidth = 40
+  const pillWidth = PILL_COLLAPSED_WIDTH
   const pillHeight = 136
   const margin = 6
+  pillExpanded = false
+  pillExpandedSide = 'left'
 
   pillWindow = new BrowserWindow({
     width: pillWidth,
@@ -2016,6 +2192,7 @@ app.on('before-quit', async () => {
     pillWindow = null
   }
   stopHealthPolling()
+  clearMeetingEndDebounce()
   if (simulationTimer) clearInterval(simulationTimer)
   if (activeStreamingWs) await activeStreamingWs.finish(1000).catch(() => {})
   if (activeCaptureSession) await activeCaptureSession.close().catch(() => {})

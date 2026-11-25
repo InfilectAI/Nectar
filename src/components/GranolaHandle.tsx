@@ -1,10 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
-import { Pause, Play, Square } from 'lucide-react'
+import { Pause, Play, Square, X } from 'lucide-react'
+
+export interface PillMeetingNotice {
+  kind: 'started' | 'ended'
+  title: string
+  platform?: string
+  isRecording?: boolean
+}
 
 export interface GranolaHandleProps {
   status: 'idle' | 'recording' | 'paused'
   meetingDetected?: boolean
   audioLevel?: number
+  notice?: PillMeetingNotice | null
+  noticeSide?: 'left' | 'right'
+  onDismissNotice?: () => void
   onStart: () => void
   onPause: () => void
   onResume: () => void
@@ -33,6 +43,9 @@ export function GranolaHandle({
   status,
   meetingDetected = false,
   audioLevel = 0,
+  notice = null,
+  noticeSide = 'left',
+  onDismissNotice,
   onStart,
   onPause,
   onResume,
@@ -156,16 +169,99 @@ export function GranolaHandle({
           ? 'bg-[#4ADE80]/85'
           : 'bg-[#71717A]'
 
+  const noticeCard = notice ? (
+    <div
+      onPointerDown={(e) => e.stopPropagation()}
+      className="flex w-[224px] shrink-0 flex-col gap-1.5 rounded-[12px] bg-[#1C1C1E]/95 border border-white/14 px-3 py-2.5 shadow-[0_8px_22px_rgba(0,0,0,0.42)] backdrop-blur-md text-white"
+    >
+      <div className="flex items-center justify-between gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span
+            className={`h-2 w-2 shrink-0 rounded-full ${
+              notice.kind === 'started'
+                ? 'bg-[#4ADE80] animate-pulse'
+                : notice.isRecording
+                  ? 'bg-[#FF5A1F] animate-pulse'
+                  : 'bg-[#A1A1AA]'
+            }`}
+          />
+          <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-white/85 truncate">
+            {notice.kind === 'started' ? 'Meeting started' : 'Meeting ended'}
+          </span>
+        </div>
+        {onDismissNotice && (
+          <button
+            type="button"
+            onClick={onDismissNotice}
+            title="Dismiss"
+            className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-white/55 hover:bg-white/12 hover:text-white cursor-pointer"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+
+      <div className="text-[12px] font-medium leading-snug text-white/95 truncate">
+        {notice.title}
+      </div>
+
+      {notice.kind === 'started' ? (
+        <div className="flex items-center gap-1.5 pt-0.5">
+          <button
+            type="button"
+            onClick={() => {
+              onDismissNotice?.()
+              onStart()
+            }}
+            className="flex-1 inline-flex items-center justify-center gap-1 rounded-full bg-[#4ADE80] px-2.5 py-1 font-mono text-[10.5px] font-semibold text-[#111113] hover:bg-[#22C55E] transition-colors cursor-pointer"
+          >
+            <Play className="h-2.5 w-2.5 fill-current" />
+            Record
+          </button>
+          {onOpenApp && (
+            <button
+              type="button"
+              onClick={onOpenApp}
+              className="rounded-full bg-white/12 px-2.5 py-1 font-mono text-[10.5px] font-medium text-white/85 hover:bg-white/20 transition-colors cursor-pointer"
+            >
+              Open
+            </button>
+          )}
+        </div>
+      ) : notice.isRecording ? (
+        <div className="flex items-center gap-1.5 pt-0.5">
+          <button
+            type="button"
+            onClick={() => {
+              onDismissNotice?.()
+              onStop()
+            }}
+            className="flex-1 inline-flex items-center justify-center gap-1 rounded-full bg-[#FF5A1F] px-2.5 py-1 font-mono text-[10.5px] font-semibold text-white hover:bg-[#EA4C10] transition-colors cursor-pointer"
+          >
+            <Square className="h-2.5 w-2.5 fill-current" />
+            Stop &amp; Enhance
+          </button>
+        </div>
+      ) : null}
+    </div>
+  ) : null
+
   return (
     <div
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
-      className="group relative flex flex-col items-center select-none cursor-grab active:cursor-grabbing"
+      className={`flex items-end gap-2 select-none ${
+        noticeSide === 'right' ? 'flex-row-reverse' : 'flex-row'
+      }`}
     >
+      {noticeCard}
+      <div
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        className="group relative flex flex-col items-center cursor-grab active:cursor-grabbing"
+      >
       <div
         className={`flex w-[36px] flex-col items-center justify-between rounded-full bg-[#1C1C1E]/95 border border-white/14 shadow-[0_6px_18px_rgba(0,0,0,0.36)] backdrop-blur-md transition-all duration-150 ease-out ${
           hovered ? 'py-2 gap-1.5' : 'h-[68px] py-2.5'
@@ -274,6 +370,7 @@ export function GranolaHandle({
             className={`w-[3px] rounded-full transition-all duration-100 ${barColor}`}
           />
         </button>
+      </div>
       </div>
     </div>
   )
