@@ -63,6 +63,10 @@
     "asarUnpack": [
       "node_modules/@infilectai/aira/bin/**",
       "node_modules/@infilectai/cortex/bin/**",
+      "node_modules/@infilectai/synapse/**",
+      "dist-electron/mcp-server.js",
+      "dist-electron/store.js",
+      "package.json",
       "bin/**"
     ],
     "mac": {

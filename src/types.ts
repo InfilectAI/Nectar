@@ -162,6 +162,7 @@ export interface AppState {
   activeCaptureMeetingId: string | null
   activeCaptureKind: 'meeting' | 'self-note' | null
   activeRoster?: string[]
+  meetingEndedPrompt?: { title: string; platform: string } | null
   capturePaused: boolean
   permissions: Record<string, string>
   meetings: MeetingRecord[]
@@ -226,6 +227,7 @@ declare global {
       focusMainWindow(): Promise<{ ok: boolean }>
       startPillDrag(): void
       dragPill(): void
+      setPillExpanded(expanded: boolean): Promise<{ side: 'left' | 'right' }>
       installMcp(
         target: 'claude' | 'codex' | 'cursor' | 'copilot' | 'vscode',
       ): Promise<{

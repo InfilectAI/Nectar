@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as http from 'node:http'
 import * as os from 'node:os'
@@ -510,4 +511,213 @@ describe('Cloud API smoke-test validator & legacy preset cleanup', () => {
     }
   })
 })
+
+describe('Standalone stdio MCP bridge (bin/nectar-mcp.js)', () => {
+  it('unpacks all runtime modules required by bin/nectar-mcp.js in package.json asarUnpack', () => {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.resolve('package.json'), 'utf8'),
+    )
+    const unpack = pkg.build?.asarUnpack ?? []
+    for (const required of [
+      'bin/**',
+      'package.json',
+      'dist-electron/mcp-server.js',
+      'dist-electron/store.js',
+      'node_modules/@infilectai/synapse/**',
+    ]) {
+      assert.ok(
+        unpack.includes(required),
+        `Expected build.asarUnpack to include "${required}"`,
+      )
+    }
+  })
+
+  it('handles initialize and tools/list offline when Nectar HTTP MCP is unreachable', async () => {
+    const dir = makeTempDir()
+    const child = spawn(process.execPath, [path.resolve('bin/nectar-mcp.js')], {
+      env: {
+        ...process.env,
+        NECTAR_DATA_DIR: dir,
+        NECTAR_MCP_URL: 'http://127.0.0.1:1/mcp',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+
+    const lines = []
+    let buf = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      buf += chunk
+      let idx
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx).trim()
+        buf = buf.slice(idx + 1)
+        if (line) lines.push(JSON.parse(line))
+      }
+    })
+
+    let stderr = ''
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+
+    child.stdin.write(
+      JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n',
+    )
+    child.stdin.write(
+      JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n',
+    )
+    child.stdin.write(
+      JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n',
+    )
+    child.stdin.end()
+
+    const exitCode = await new Promise((resolve) => child.once('close', resolve))
+    assert.equal(exitCode, 0, `Expected clean exit, got ${exitCode}. stderr: ${stderr}`)
+    assert.equal(lines.length, 2)
+    assert.equal(lines[0].id, 1)
+    assert.equal(lines[0].result.serverInfo.name, 'nectar-mcp')
+    assert.equal(lines[1].id, 2)
+    const toolNames = lines[1].result.tools.map((t) => t.name)
+    assert.deepEqual(toolNames, ['list_meetings', 'get_meeting', 'find_memory'])
+  })
+
+  it('proxies stdio requests to a live Nectar HTTP MCP server when running', async () => {
+    const dir = makeTempDir()
+    let proxiedCalls = 0
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => {
+        body += c
+      })
+      req.on('end', () => {
+        proxiedCalls += 1
+        const parsed = JSON.parse(body)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: { serverInfo: { name: 'live-nectar-http' } },
+          }),
+        )
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+
+    try {
+      const child = spawn(process.execPath, [path.resolve('bin/nectar-mcp.js')], {
+        env: {
+          ...process.env,
+          NECTAR_DATA_DIR: dir,
+          NECTAR_MCP_URL: `http://127.0.0.1:${port}/mcp`,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let out = ''
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', (chunk) => {
+        out += chunk
+      })
+      child.stdin.write(
+        JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'initialize', params: {} }) + '\n',
+      )
+      child.stdin.end()
+
+      const exitCode = await new Promise((resolve) => child.once('close', resolve))
+      assert.equal(exitCode, 0)
+      assert.equal(proxiedCalls, 1)
+      const parsed = JSON.parse(out.trim())
+      assert.equal(parsed.result.serverInfo.name, 'live-nectar-http')
+    } finally {
+      server.close()
+    }
+  })
+})
+
+describe('Transcript consecutive turn grouping & summary/action item helpers', () => {
+  it('merges consecutive turns from the same speaker and keeps distinct speakers separate', async () => {
+    const { groupConsecutiveTurns, groupActionItemsByOwner, stripMarkdownActionItemsSection } =
+      await import('../src/utils/format.ts')
+    const blocks = groupConsecutiveTurns([
+      { id: 't1', speaker: 'prudhvi', participantId: 'speaker_0', text: 'Yeah. Yeah.', t0: 26, t1: 27 },
+      { id: 't2', speaker: 'Abhi Jain', participantId: 'speaker_1', text: 'Awesome. Cool.', t0: 27, t1: 38 },
+      { id: 't3', speaker: 'Abhi Jain', participantId: 'speaker_1', text: "and then we'll try to build something.", t0: 38, t1: 47 },
+      { id: 't4', speaker: 'prudhvi', participantId: 'speaker_0', text: 'Sounds good.', t0: 48, t1: 49 },
+    ])
+    assert.equal(blocks.length, 3)
+    assert.equal(blocks[0].speaker, 'prudhvi')
+    assert.equal(blocks[1].speaker, 'Abhi Jain')
+    assert.equal(blocks[1].t0, 27)
+    assert.equal(blocks[1].t1, 47)
+    assert.equal(blocks[1].text, "Awesome. Cool. and then we'll try to build something.")
+    assert.deepEqual(blocks[1].turnIds, ['t2', 't3'])
+    assert.equal(blocks[2].speaker, 'prudhvi')
+
+    const groupedActions = groupActionItemsByOwner([
+      { owner: '@Vargas Fuertes', task: 'Share agent mailbox RFC', status: 'open' },
+      { owner: 'Ben Levitt', task: 'Confirm staging deployment', status: 'open' },
+      { owner: 'vargas fuertes', task: 'Share agent mailbox RFC', status: 'open' },
+      { owner: 'Vargas Fuertes', task: 'Align with tuning team on ownership', status: 'open' },
+    ])
+    assert.equal(groupedActions.length, 2)
+    assert.equal(groupedActions[0].owner, 'Vargas Fuertes')
+    assert.equal(groupedActions[0].items.length, 2)
+    assert.equal(groupedActions[1].owner, 'Ben Levitt')
+
+    const stripped = stripMarkdownActionItemsSection(
+      '### Executive Summary\nGood sync.\n\n### Action Items\n- [ ] Dup item\n\n### Key Decisions\n- Ship v1',
+    )
+    assert.ok(!stripped.includes('Action Items'))
+    assert.ok(stripped.includes('Executive Summary'))
+    assert.ok(stripped.includes('Key Decisions'))
+  })
+
+  it('deterministic distiller ignores rhetorical questions and never duplicates action items in markdown', async () => {
+    const { deterministicDistill } = await import('../dist-electron/distiller.js')
+    const result = deterministicDistill({
+      id: 'm1',
+      title: 'Persistent Agents Review',
+      platform: 'zoom',
+      url: 'zoom://meeting/1',
+      startedAt: '2026-11-24T12:00:00.000Z',
+      endedAt: null,
+      status: 'completed',
+      participants: ['Vargas Fuertes', 'Ben Levitt'],
+      roughNotes: '',
+      distilledNotes: '',
+      actionItems: [],
+      decisions: [],
+      episodeId: null,
+      turns: [
+        {
+          id: '1',
+          meetingId: 'm1',
+          speaker: 'Vargas Fuertes',
+          participantId: 'speaker_0',
+          text: 'How will this get exposed to an agent?',
+          t0: 10,
+          t1: 15,
+          createdAt: '2026-11-24T12:00:10.000Z',
+        },
+        {
+          id: '2',
+          meetingId: 'm1',
+          speaker: 'Ben Levitt',
+          participantId: 'speaker_1',
+          text: "I'll set up the account universe routine in staging.",
+          t0: 20,
+          t1: 25,
+          createdAt: '2026-11-24T12:00:20.000Z',
+        },
+      ],
+    })
+    assert.equal(result.actionItems.length, 1)
+    assert.equal(result.actionItems[0].owner, 'Ben Levitt')
+    assert.ok(!result.distilledNotes.includes('### Action Items'))
+  })
+})
+
 
