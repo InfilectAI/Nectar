@@ -1,6 +1,6 @@
 {
   "name": "@infilectai/nectar",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Nectar — macOS meeting notepad, speaker-attributed transcription, temporal memory, and local MCP server powered by Aira, Cortex, and Synapse.",
   "license": "MIT",
   "private": true,
